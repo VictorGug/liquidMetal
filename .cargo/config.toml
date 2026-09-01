@@ -1,0 +1,6 @@
+# The bundled SDL2 sources ship a `cmake_minimum_required(VERSION 3.0)`, and the
+# CMake on this box is 4.3, which removed compatibility with < 3.5 entirely.
+# CMake 4.x honours this as an environment variable, so setting it here makes a
+# plain `cargo build` work without the caller having to export anything.
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"
