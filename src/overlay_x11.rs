@@ -619,6 +619,11 @@ impl X11 {
     ///
     /// KWin will happily constrain a freshly mapped window to one monitor's work
     /// area; this asks for the whole virtual screen back.
+    /// Nothing to re-assert per frame. The macOS twin rebuilds its GL surface here,
+    /// because on that platform transparency does not stick until the window has been
+    /// presented; X11 settles it once, when the visual is chosen.
+    pub fn on_frame(&mut self) {}
+
     pub fn force_full_screen_geometry(&self) -> Result<(), String> {
         let win = self.win()?;
         self.conn

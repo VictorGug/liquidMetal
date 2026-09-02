@@ -24,7 +24,7 @@ brew install sdl2
 cargo run --release --no-default-features
 ```
 
-## What this build has not been through
+## What this build has been through
 
 It was written and type-checked on Linux, against the real macOS target:
 
@@ -35,12 +35,24 @@ cargo check-mac
 
 That compiles every `cfg(target_os = "macos")` path with the real
 `aarch64-apple-darwin` target, so the types, the Objective-C message signatures and
-the SDL bindings are all checked. It does **not** link, and it has never run. So
-the failure modes to expect are runtime ones — a window at the wrong level, a
-property SDL overwrites, a permission macOS wants — not compile errors.
+the SDL bindings are all checked. It does **not** link.
 
-The three things most likely to be wrong on first run are listed at the bottom,
-with what to do about each.
+It has since been run, on **macOS 26.6.2, Apple M4 Pro, SDL 2.26.4, Rust 1.98**.
+What that first run found is what the transparency section below now documents: the
+physics, the protocol, the renderer and the shader were all correct first time, and
+the overlay came up as a black rectangle covering the desktop. `setOpaque:NO` plus
+`NSOpenGLCPSurfaceOpacity` — the whole of what this document used to say was needed —
+is not enough on this OS, and every readback said it was working while the screen
+was black.
+
+One caveat on the test suite: `net::tests::node_ids_do_not_collide` fails here and
+passes on Linux. `random_node_id` mixes the pid, the wall clock and a heap address,
+and on macOS all three collapse inside a loop — `SystemTime::now()` advances about
+107 times per 1000 calls where Linux gives nanosecond resolution, and the
+immediately-dropped `Box` is handed back the same two addresses. 1000 calls produce
+about 40 distinct ids. It matters little in practice, since one id is drawn per
+process and two real machines differ in more than the clock, but the generator does
+assume a clock that ticks between calls.
 
 ## First run: work up the ladder
 
@@ -88,33 +100,54 @@ good, and step 5 is only about Cocoa.
 | always on top | `_NET_WM_STATE_ABOVE` | `setLevel:` to `NSStatusWindowLevel` (25) |
 | click-through except on the blob | XShape `ShapeInput` region | there is no such thing — see below |
 
-### Transparency has the same trap, in a different place
+### Transparency has the same trap, in a different place — and it is worse
 
 On X11 the silent failure is `SDL_GL_ALPHA_SIZE` reporting 8 bits on a window that
 has no alpha channel, because GLX will happily give you alpha bits on a depth-24
 visual.
 
-macOS has an exactly analogous trap one layer down. You can set `setOpaque:NO`, give
-the window a clear background colour, get 8 real alpha bits, and still end up with a
-black rectangle the size of your desktop — because the **GL surface** inside the
-transparent window is still opaque. The fix is one parameter on the
-`NSOpenGLContext`:
+macOS has an exactly analogous trap one layer down, and on macOS 26 it is not one
+setting but four. You can set `setOpaque:NO`, give the window a clear background
+colour, get 8 real alpha bits, set `NSOpenGLCPSurfaceOpacity` to 0, **read it back as
+0**, and still end up with a black rectangle the size of your desktop. All four of
+these are necessary and none is sufficient:
 
-```objc
-GLint zero = 0;
-[ctx setValues:&zero forParameter:NSOpenGLCPSurfaceOpacity];
+| | Why |
+| --- | --- |
+| window `setOpaque:NO` + clear background | must be in place *before* the surface is built — the surface takes its opacity from the window it is attached to at the moment of creation |
+| view `setWantsLayer:YES`, layer `opaque = NO`, nil `backgroundColor` | left implicit, AppKit gives the GL view a backing layer it composites on the opaque path |
+| `setView:nil` → set `NSOpenGLCPSurfaceOpacity` → `setView:` back → `update` | the parameter is only read when the surface is built. Setting it on a live surface is recorded, reads back as 0, and does nothing |
+| window `alphaValue` below 1.0 | a window at exactly 1.0 is handed to the WindowServer as opaque and its per-pixel alpha is never consulted at all |
+
+That last one is the cruellest, because it is invisible in every readback. 0.99 is the
+smallest lie that works: the blob is drawn at 99% opacity, which nobody can see, and
+the desktop behind it is finally visible.
+
+And then there is the timing. The whole sequence applied before the first frame is
+applied to nothing: the surface is not rebuilt against the window's new state until
+the window has actually been presented a few times. `Mac::on_frame` therefore repeats
+it on a short schedule after the window is shown — 200 ms, 500 ms, 1 s, 2 s, 4 s —
+and then leaves it alone. Applied once at start-up, however correctly, the overlay
+comes up black and stays black.
+
+The startup log states what was actually done:
+
+```
+  surface opacity   : 0 (NSOpenGLCPSurfaceOpacity), layer-backed, window alpha 0.99, re-asserted at [200, 500, 1000, 2000, 4000] ms
 ```
 
-That is `Mac::on_gl_context_ready`, and it can only run once the context exists and
-is current, which is why the overlay has a hook at that point on both platforms
-(where X11 does nothing at all). The startup log states outright whether it
-happened:
+If that line says `NOT SET`, the black rectangle is why. If it says the above and the
+screen is *still* black, the surface never got rebuilt — lengthen `REASSERT_MS`.
 
-```
-  surface opacity   : 0 (NSOpenGLCPSurfaceOpacity) — the GL surface composites with alpha
-```
+### A note on debug builds
 
-If that line says `NOT SET`, the black rectangle is why.
+`objc2` verifies the type encoding of every message send when debug assertions are
+on, and release builds skip the check. A wrong argument type is therefore a panic
+under `cargo run` and silence under `cargo run --release`. `-[CALayer
+setBackgroundColor:]` takes a `CGColorRef`, not an `NSColor *` like its NSWindow
+namesake, and passing an object pointer is exactly this kind of bug. **Run the debug
+build at least once after touching this file** — it is the only thing that checks
+these signatures at runtime.
 
 ### There is no input region on macOS
 

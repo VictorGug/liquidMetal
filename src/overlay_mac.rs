@@ -38,9 +38,29 @@
 //!   clickable when the pointer is genuinely on the blob, and put back immediately
 //!   afterwards.
 
+use objc2::encode::{Encode, Encoding, RefEncode};
 use objc2::rc::autoreleasepool;
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
+
+/// `CGColorRef` is a pointer to an opaque Core Graphics struct, not an object.
+///
+/// It matters because `-[CALayer setBackgroundColor:]` takes one, while its NSWindow
+/// namesake takes an `NSColor *`. Passing an object pointer to the layer is wrong in
+/// a way release builds run happily and a debug build refuses outright: objc2 checks
+/// the selector's type encoding, and `@` where `^{CGColor=}` is expected is a panic.
+#[repr(C)]
+struct CGColor {
+    _opaque: [u8; 0],
+}
+
+// SAFETY: the encodings are the ones the Objective-C runtime reports for CGColorRef.
+unsafe impl Encode for CGColor {
+    const ENCODING: Encoding = Encoding::Struct("CGColor", &[]);
+}
+unsafe impl RefEncode for CGColor {
+    const ENCODING_REF: Encoding = Encoding::Pointer(&Self::ENCODING);
+}
 
 // ---------------------------------------------------------------------------
 // TUNABLES
@@ -51,6 +71,22 @@ use objc2::{class, msg_send};
 /// stopping 25 points down. `NSFloatingWindowLevel` (3) is the politer choice if
 /// you would rather the menu bar won.
 const WINDOW_LEVEL: i64 = 25;
+
+/// How opaque the window claims to be. Anything below 1.0 puts the window on the
+/// WindowServer's blended path, which is the only path that consults the alpha the
+/// shader writes; at exactly 1.0 the overlay is a black rectangle however
+/// transparent everything underneath is set to be. See `set_window_transparency`.
+const WINDOW_ALPHA: f64 = 0.99;
+
+/// When to re-assert transparency after the window is shown, in milliseconds.
+///
+/// Doing it once is not enough and the reason is timing: the GL surface is not
+/// rebuilt against the new window state until the window has actually been presented
+/// a few times, so the whole sequence applied before the first frame is applied to
+/// nothing and the overlay comes up black. Re-asserting on a short schedule costs a
+/// handful of Objective-C messages and covers whatever the real threshold is on a
+/// given machine. The last one is late enough to survive a slow first frame.
+const REASSERT_MS: &[u64] = &[200, 500, 1000, 2000, 4000];
 
 /// `NSWindowCollectionBehaviorCanJoinAllSpaces | Stationary | FullScreenAuxiliary`.
 /// Follow the user between Spaces instead of belonging to the one it was born on,
@@ -192,6 +228,10 @@ pub struct Mac {
     rects: Vec<(i32, i32, i32, i32)>,
     /// Set once the surface opacity has been applied, so it is only done once.
     surface_made_transparent: bool,
+    /// When the window was shown, and which of the re-assert deadlines are left.
+    /// See `on_frame` for why the overlay cannot simply be made transparent once.
+    shown_at: Option<std::time::Instant>,
+    pending_reasserts: &'static [u64],
     /// There is no visual to choose on macOS; Cocoa composites every window. Present
     /// only because `main.rs` reads it on both platforms.
     pub argb_visual: Option<u32>,
@@ -209,6 +249,8 @@ impl Mac {
             click_through: true,
             rects: Vec::new(),
             surface_made_transparent: false,
+            shown_at: None,
+            pending_reasserts: REASSERT_MS,
             argb_visual: None,
         })
     }
@@ -283,9 +325,7 @@ impl Mac {
             // every selector below is a documented AppKit method on NSWindow with
             // the argument types given here.
             unsafe {
-                let _: () = msg_send![w, setOpaque: false];
-                let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
-                let _: () = msg_send![w, setBackgroundColor: clear];
+                self.set_window_transparency();
                 let _: () = msg_send![w, setLevel: WINDOW_LEVEL];
                 let _: () = msg_send![w, setCollectionBehavior: COLLECTION_BEHAVIOR];
                 // Nothing to drag, nothing to drop on us.
@@ -295,6 +335,31 @@ impl Mac {
             }
         });
         Ok(())
+    }
+
+    /// The window half of being transparent: non-opaque, no background, and not
+    /// quite fully opaque.
+    ///
+    /// The `alphaValue` is the surprising one. A window at alpha 1.0 is handed to the
+    /// WindowServer as opaque and its per-pixel alpha is never consulted, however
+    /// non-opaque the window and its surface claim to be. Anything below 1.0 puts it
+    /// on the blended path, where the alpha the shader writes is finally what gets
+    /// composited. 0.99 is the smallest lie that does it: the blob is drawn at 99%
+    /// opacity, which is not visible, and the desktop behind it is.
+    ///
+    /// SAFETY: caller holds a live NSWindow in `self.ns_window`; every selector is a
+    /// documented NSWindow method with the argument types given here.
+    unsafe fn set_window_transparency(&self) {
+        let w = self.ns_window;
+        if w.is_null() {
+            return;
+        }
+        unsafe {
+            let _: () = msg_send![w, setOpaque: false];
+            let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
+            let _: () = msg_send![w, setBackgroundColor: clear];
+            let _: () = msg_send![w, setAlphaValue: WINDOW_ALPHA];
+        }
     }
 
     /// Turn off the GL surface's opacity, so what the shader writes as alpha is what
@@ -318,15 +383,68 @@ impl Mac {
                 return Err("there is no current GL context to make transparent".into());
             }
             let ctx = ctx as *mut AnyObject;
+
+            // The window first. The surface takes its opacity from the window it is
+            // attached to at the moment it is built, so a surface built against the
+            // opaque window SDL created stays opaque no matter what is set afterwards.
+            self.set_window_transparency();
+
+            // Then the view, which has to be explicitly layer-backed. Left implicit,
+            // AppKit gives the GL view a backing layer it composites on the opaque
+            // path; asking for the layer by name is what moves it onto the path where
+            // per-pixel alpha is honoured at all.
+            let view: *mut AnyObject = msg_send![ctx, view];
+            if !view.is_null() {
+                let _: () = msg_send![view, setWantsLayer: true];
+                let layer: *mut AnyObject = msg_send![view, layer];
+                if !layer.is_null() {
+                    let _: () = msg_send![layer, setOpaque: false];
+                    let no_colour: *mut CGColor = std::ptr::null_mut();
+                    let _: () = msg_send![layer, setBackgroundColor: no_colour];
+                }
+            }
+
+            // And only now the parameter, with the surface torn down around it so it
+            // is rebuilt while the value is already set. Setting it on a live surface
+            // is what fails silently: it reads back as 0 on a screen that is still
+            // black, which is the whole trap this function exists to avoid.
             let opacity: i32 = 0;
+            let nil: *mut AnyObject = std::ptr::null_mut();
+            let _: () = msg_send![ctx, setView: nil];
             let _: () = msg_send![
                 ctx,
                 setValues: &opacity as *const i32,
                 forParameter: NSOPENGL_CP_SURFACE_OPACITY,
             ];
+            if !view.is_null() {
+                let _: () = msg_send![ctx, setView: view];
+            }
+            let _: () = msg_send![ctx, makeCurrentContext];
+            let _: () = msg_send![ctx, update];
         }
         self.surface_made_transparent = true;
         Ok(())
+    }
+
+    /// Re-assert transparency over the first few frames after the window is shown.
+    ///
+    /// The single most surprising thing about the macOS overlay. Every part of making
+    /// the surface transparent can be applied, read back as correct, and still leave a
+    /// black rectangle, because the surface is only rebuilt against the window's
+    /// current state once the window has been presented — which has not happened yet
+    /// at the point where all the obvious hooks run. So the sequence is repeated on
+    /// the schedule in `REASSERT_MS` and then left alone.
+    pub fn on_frame(&mut self) {
+        let Some(shown) = self.shown_at else { return };
+        let elapsed = shown.elapsed().as_millis() as u64;
+        while let Some(&due) = self.pending_reasserts.first() {
+            if elapsed < due {
+                break;
+            }
+            self.pending_reasserts = &self.pending_reasserts[1..];
+            let _ = self.apply_overlay_properties();
+            let _ = self.on_gl_context_ready();
+        }
     }
 
     fn set_ignores_mouse(&mut self, ignore: bool) -> Result<(), String> {
@@ -425,6 +543,7 @@ impl Mac {
     /// costs one round of messages and removes a whole class of "it was transparent
     /// until it appeared" bug that would be very hard to diagnose remotely.
     pub fn nudge_state(&mut self) -> Result<(), String> {
+        self.shown_at = Some(std::time::Instant::now());
         self.apply_overlay_properties()?;
         // And the surface parameter too, in case showing the window rebuilt the
         // surface underneath it. Cheap, and the failure it guards against — an
@@ -463,11 +582,15 @@ impl Mac {
                 self.size.0, self.size.1, self.origin.0, self.origin.1
             ),
         ));
-        // The one that fails silently, so it is stated outright.
+        // The one that fails silently, so it is stated outright. Note that a value
+        // of 0 here is necessary and nowhere near sufficient — see `on_frame`.
         out.push((
             "surface opacity",
             if self.surface_made_transparent {
-                "0 (NSOpenGLCPSurfaceOpacity) — the GL surface composites with alpha".into()
+                format!(
+                    "0 (NSOpenGLCPSurfaceOpacity), layer-backed, window alpha {WINDOW_ALPHA}, \
+                     re-asserted at {REASSERT_MS:?} ms"
+                )
             } else {
                 "NOT SET  <-- the overlay will be a black rectangle".to_string()
             },

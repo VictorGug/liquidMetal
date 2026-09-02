@@ -629,6 +629,10 @@ fn run(mode: &Mode, netopts: &NetOpts) -> Result<(), String> {
             app.track.push(start.elapsed().as_secs_f64(), app.cursor);
         }
 
+        if let Some(x) = x11.as_mut() {
+            x.on_frame();
+        }
+
         // --- fixed-timestep accumulator, decoupled from the render rate ---
         let now = Instant::now();
         let frame_dt = (now - last).as_secs_f32().min(physics::MAX_FRAME_TIME);

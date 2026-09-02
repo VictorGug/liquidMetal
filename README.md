@@ -62,8 +62,9 @@ brew install cmake
 ```
 
 Nothing else — the same bundled SDL2 covers the rest. See
-[`doc/macos.md`](doc/macos.md), and read the note there about what this build has and
-has not been through before trusting it.
+[`doc/macos.md`](doc/macos.md), in particular the transparency section: on macOS 26
+an overlay that is transparent takes four separate settings and a re-assert, and
+every one of them reads back as correct while the screen is still black.
 
 ### Optional
 
@@ -434,11 +435,14 @@ cargo run --release -- --capture /tmp/blob.pam && magick /tmp/blob.pam /tmp/blob
   to the visible part of the window and cannot be dragged onto monitors the window
   does not cover. KWin relents on retry here, so this is a fallback rather than the
   normal path; the startup log says which happened.
-- **The macOS overlay has been type-checked but never run.** It was written on
-  Linux against the `aarch64-apple-darwin` target, so the Objective-C message
-  signatures and the SDL bindings are checked by the compiler — but nothing has
-  linked it or put a window on a screen. `doc/macos.md` lists what is most likely to
-  be wrong on a first run and what to do about each.
+- **The macOS overlay is transparent by repetition, not by one setting.** Four
+  separate things have to be true — a non-opaque window in place before the surface
+  is built, an explicitly layer-backed view, the surface parameter set while the
+  surface is torn down, and a window `alphaValue` below 1.0 — and none of them takes
+  effect until the window has been presented, so the whole sequence is re-asserted
+  over the first four seconds. Every part of it reads back as correct while the
+  screen is still black, which is what makes it worth writing down. See
+  [`doc/macos.md`](doc/macos.md).
 - **There is no Windows overlay.** The protocol is free of anything
   platform-specific and `--net-echo` proves it can be spoken by a program that is
   not this one, so a third platform needs only its own `overlay_*.rs`: a
