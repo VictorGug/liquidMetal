@@ -615,15 +615,15 @@ impl X11 {
             .map_err(|e| format!("could not flush the X connection: {e}"))
     }
 
-    /// Put the window back at the origin at full virtual-screen size.
-    ///
-    /// KWin will happily constrain a freshly mapped window to one monitor's work
-    /// area; this asks for the whole virtual screen back.
     /// Nothing to re-assert per frame. The macOS twin rebuilds its GL surface here,
     /// because on that platform transparency does not stick until the window has been
     /// presented; X11 settles it once, when the visual is chosen.
     pub fn on_frame(&mut self) {}
 
+    /// Put the window back at the origin at full virtual-screen size.
+    ///
+    /// KWin will happily constrain a freshly mapped window to one monitor's work
+    /// area; this asks for the whole virtual screen back.
     pub fn force_full_screen_geometry(&self) -> Result<(), String> {
         let win = self.win()?;
         self.conn
