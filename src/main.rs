@@ -15,13 +15,16 @@ mod overlay;
 #[cfg(target_os = "macos")]
 #[path = "overlay_mac.rs"]
 mod overlay;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+#[path = "overlay_win.rs"]
+mod overlay;
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 compile_error!(
-    "liquidMetal has an overlay for Linux (X11/XWayland) and macOS (Cocoa). \
-     Porting it to another platform means writing the equivalent of src/overlay_x11.rs \
-     for it: a transparent, always-on-top, click-through-except-on-the-blob window. \
-     Everything else — physics, renderer, shader and the network protocol — is already \
-     portable."
+    "liquidMetal has an overlay for Linux (X11/XWayland), macOS (Cocoa) and Windows \
+     (DWM). Porting it to another platform means writing the equivalent of \
+     src/overlay_x11.rs for it: a transparent, always-on-top, \
+     click-through-except-on-the-blob window. Everything else — physics, renderer, \
+     shader and the network protocol — is already portable."
 );
 
 mod physics;

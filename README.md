@@ -7,8 +7,8 @@ through to whatever is behind it.
 
 ![the blob](doc/blob.png)
 
-Runs on **Linux** (X11/XWayland) and **macOS** (Cocoa). The two can throw the blob
-to each other.
+Runs on **Linux** (X11/XWayland), **macOS** (Cocoa) and **Windows** (DWM). Any of
+them can throw the blob to any other.
 
 ## Requirements
 
@@ -123,8 +123,9 @@ The first build compiles SDL2 from the vendored sources and takes a minute or tw
 after that it is cached. See [Requirements](#requirements) for what has to be
 installed, which on Linux is CMake, a C compiler and the X11 development headers.
 
-The overlay is a genuinely different animal on macOS, and
-[`doc/macos.md`](doc/macos.md) is where those differences are written down.
+The overlay is a genuinely different animal on each platform;
+[`doc/macos.md`](doc/macos.md) and [`doc/windows.md`](doc/windows.md) are where those
+differences are written down.
 
 | Flag | What it does |
 | --- | --- |
@@ -298,23 +299,30 @@ security boundary. It is a desk toy on a LAN; treat it as one.
 ## Two platforms, one frame loop
 
 `main.rs` names the platform module `overlay` whichever machine it is built for, and
-both `overlay_x11.rs` and `overlay_mac.rs` provide the same handful of items. The
-frame loop is written once and neither platform is a special case inside it. Where
-the two genuinely differ, the difference is a named constant rather than a `cfg`
+`overlay_x11.rs`, `overlay_mac.rs` and `overlay_win.rs` all provide the same handful
+of items. The frame loop is written once and no platform is a special case inside it.
+Where they genuinely differ, the difference is a named constant rather than a `cfg`
 buried in the loop:
 
-| | `overlay_x11.rs` | `overlay_mac.rs` |
-| --- | --- | --- |
-| `IDLE_WAIT_MS` | 66 — the X server wakes us when the pointer touches the blob | 30 — nothing can wake us, so we have to look |
-| `REGION_IS_THE_HIT_TEST` | `true` — a click that arrives already landed on the blob | `false` — the toggle is a frame stale, so test locally too |
-| `NEEDS_VISUAL_STRATEGY` | `true` — a list of ARGB visual strategies to try | `false` — Cocoa composites everything |
+| | `overlay_x11.rs` | `overlay_mac.rs` | `overlay_win.rs` |
+| --- | --- | --- | --- |
+| `IDLE_WAIT_MS` | 66 — the X server wakes us when the pointer touches the blob | 30 — nothing can wake us, so we have to look | 30 — same |
+| `REGION_IS_THE_HIT_TEST` | `true` — a click that arrives already landed on the blob | `false` — the toggle is a frame stale, so test locally too | `false` — same |
+| `NEEDS_VISUAL_STRATEGY` | `true` — a list of ARGB visual strategies to try | `false` — Cocoa composites everything | `false` — DWM composites everything |
 
-The macOS half is type-checked from Linux against the real target, which catches
-everything except runtime behaviour:
+The one real architectural split is that **only X11 has an input region**. The server
+decides per pixel whether a click is ours, so the app never hears about clicks that
+missed the blob. Neither Cocoa nor Win32 has an equivalent that does not also clip
+what is drawn, so both emulate it: each frame the global cursor is tested against the
+same rectangle cover, and the whole window is toggled between clickable and not.
+
+Both non-Linux halves are type-checked from Linux against their real targets, which
+catches everything except runtime behaviour:
 
 ```sh
-rustup target add aarch64-apple-darwin
+rustup target add aarch64-apple-darwin x86_64-pc-windows-msvc
 cargo check-mac
+cargo check-win
 ```
 
 ## The KDE / XWayland assumption
@@ -403,6 +411,7 @@ explicitly rather than left for you to discover by looking at a black screen.
 src/main.rs      event loop, fixed-timestep accumulator, GL/visual strategy, wiring
 src/overlay_x11.rs  Linux: ARGB visual discovery, EWMH properties, XShape input region
 src/overlay_mac.rs  macOS: Cocoa window properties, GL surface opacity, click-through
+src/overlay_win.rs  Windows: DWM per-pixel alpha, extended window styles, click-through
 src/physics.rs   blob soft-body sim; pure, no SDL/GL/X types, unit-tested
 src/render.rs    GL context, shader compile, uniform upload, draw, framebuffer readback
 src/shader.frag  the metal shader
@@ -511,11 +520,15 @@ cargo run --release -- --capture /tmp/blob.pam && magick /tmp/blob.pam /tmp/blob
   over the first four seconds. Every part of it reads back as correct while the
   screen is still black, which is what makes it worth writing down. See
   [`doc/macos.md`](doc/macos.md).
-- **There is no Windows overlay.** The protocol is free of anything
-  platform-specific and `--net-echo` proves it can be spoken by a program that is
-  not this one, so a third platform needs only its own `overlay_*.rs`: a
-  transparent, always-on-top, click-through-except-on-the-blob window. Everything
-  else already ports.
+- **The Windows overlay has been type-checked but never run**, exactly as the macOS
+  one had not been before it was. It was written on Linux against the
+  `x86_64-pc-windows-msvc` target, so the Win32 signatures are compiler-checked, but
+  nothing has linked it or put a window on a screen. `doc/windows.md` lists what is
+  most likely to be wrong first.
+- **`Esc` does not quit on Windows.** The overlay sets `WS_EX_NOACTIVATE` so that
+  clicking the blob does not steal focus from what you were doing, and the cost is
+  that it never receives keyboard focus either. Middle-click and `Ctrl+C` still
+  work.
 - **A blob in flight when you quit is gone.** If you close the program in the
   fraction of a second between the blob leaving and the receipt arriving, and the
   peer had in fact taken it, the peer keeps it — which is correct. If the peer had
