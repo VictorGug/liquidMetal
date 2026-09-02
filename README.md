@@ -12,6 +12,11 @@ to each other.
 
 ## Requirements
 
+Almost everything below is needed to **build** it, which includes
+[installing](#installing-it) it — `cargo install` compiles SDL2 from source rather
+than downloading anything. Running an already-built binary needs far less, and that
+is spelled out at the end.
+
 **Rust 1.85 or newer.** The crate is edition 2024, which is what sets the floor; no
 dependency asks for more than 1.71. Built and tested on 1.96.1.
 
@@ -65,6 +70,26 @@ Nothing else — the same bundled SDL2 covers the rest. See
 [`doc/macos.md`](doc/macos.md), in particular the transparency section: on macOS 26
 an overlay that is transparent takes four separate settings and a re-assert, and
 every one of them reads back as correct while the screen is still black.
+
+### To run an already-built binary
+
+Less than you might expect, because the binary carries nearly everything with it.
+It links only `libc`, `libm`, `libgcc_s` and the loader — there is no `libSDL2`
+dependency, since SDL is statically linked in, and no data files, since the shader is
+compiled into the executable.
+
+What it needs on the machine it runs on:
+
+- an **X server, or XWayland**, and a compositor as described above;
+- **OpenGL 3.3**;
+- six shared libraries, which SDL opens lazily at run time rather than linking:
+  `libX11.so.6`, `libXext.so.6`, `libXfixes.so.3`, `libXrandr.so.2`,
+  `libXcursor.so.1`, `libGL.so.1`. These are the ordinary runtime packages — *not*
+  the `-devel` ones above — and any working desktop already has them.
+
+No Rust, no CMake, no compiler, no headers. So a binary built on one machine runs on
+another of the same architecture without any of the build requirements being
+installed there.
 
 ### Optional
 
