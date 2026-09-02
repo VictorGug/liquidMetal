@@ -61,11 +61,11 @@ order and the first one that fails tells you which. Each step adds exactly one
 layer.
 
 ```sh
-cargo test                          # 1. physics + protocol. No window, no sockets.
-cargo run --release -- --selftest   # 2. the simulation, scripted. Still headless.
-cargo run --release -- --windowed   # 3. renderer + shader, in an ordinary window.
-cargo run --release -- --net-echo   # 4. networking, headless — see below.
-cargo run --release                 # 5. the overlay. Everything at once.
+cargo test                       # 1. physics + protocol. No window, no sockets.
+cargo blob --selftest            # 2. the simulation, scripted. Still headless.
+cargo blob --windowed            # 3. renderer + shader, in an ordinary window.
+cargo net-echo                   # 4. networking, headless — see below.
+cargo run --release              # 5. the overlay. Everything at once.
 ```
 
 Steps 1 and 2 are pure shared code and should pass on a Mac exactly as they do on
@@ -78,13 +78,13 @@ Step 4 is worth doing before step 5, because it separates the network from the
 window entirely. On the Mac:
 
 ```sh
-cargo run --release -- --net-echo
+cargo net-echo
 ```
 
 and on the Linux box:
 
 ```sh
-cargo run --release -- --net-serve
+cargo net-serve
 ```
 
 `--net-serve` invents a blob and throws it; `--net-echo` catches it and throws it
@@ -203,7 +203,7 @@ window created for OpenGL does not have one.
 Nothing platform-specific. On both machines:
 
 ```sh
-cargo run --release -- --net
+cargo net
 ```
 
 Two things macOS will want that Linux does not:
@@ -220,7 +220,7 @@ If discovery is blocked and you would rather not fight it, name the peer directl
 The port is in the other machine's startup log:
 
 ```sh
-cargo run --release -- --peer 192.168.1.72:41521 --no-discovery
+cargo net --peer 192.168.1.72:41521 --no-discovery
 ```
 
 ## If something is wrong on the first run

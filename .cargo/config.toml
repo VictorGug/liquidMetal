@@ -16,3 +16,17 @@ CMAKE_POLICY_VERSION_MINIMUM = "3.5"
 #     cargo check-mac
 [alias]
 check-mac = "check --target aarch64-apple-darwin --no-default-features"
+
+# Shorthands for the everyday runs, mostly to be rid of the `--` separator that
+# `cargo run` needs before a flag meant for the program rather than for cargo.
+# Extra arguments still work: `cargo net --net-group kitchen` appends as you would
+# expect.
+#
+#   cargo blob        the overlay, no networking
+#   cargo net         the overlay, finding other machines
+#   cargo net-echo    a headless peer: catch a blob and throw it back
+#   cargo net-serve   the same, but put a blob into play to start with
+blob = "run --release --"
+net = "run --release -- --net"
+net-echo = "run --release -- --net-echo"
+net-serve = "run --release -- --net-serve"

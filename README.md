@@ -81,6 +81,19 @@ every one of them reads back as correct while the screen is still black.
 cargo run --release
 ```
 
+There are aliases in `.cargo/config.toml` for the runs you make most often, mostly to
+be rid of the `--` separator `cargo run` needs before a flag meant for the program
+rather than for cargo. Extra arguments still append, so `cargo net --net-group
+kitchen` does what it looks like.
+
+| Alias | Runs |
+| --- | --- |
+| `cargo blob` | `cargo run --release --` |
+| `cargo net` | the overlay, finding other machines |
+| `cargo net-echo` | a headless peer: catch a blob and throw it back |
+| `cargo net-serve` | the same, but put a blob into play to start with |
+| `cargo check-mac` | type-check the macOS build from Linux |
+
 The first build compiles SDL2 from the vendored sources and takes a minute or two;
 after that it is cached. See [Requirements](#requirements) for what has to be
 installed, which on Linux is CMake, a C compiler and the X11 development headers.
@@ -118,14 +131,15 @@ and `Esc` only reach us when we are genuinely the target.
 
 ## Throwing it to another machine
 
-Run it with `--net` on two machines and the edges of your screen stop being walls.
+Run it with `--net` on two machines — `cargo net` is a shorthand for exactly that —
+and the edges of your screen stop being walls.
 Fling the blob off the right-hand side and it leaves — sliding off the edge, still
 stretched from the throw — and arrives on the other screen a moment later, entering
 from the left at the same height, still deformed, wobbling as it settles. Throw it
 back and you have a game of catch.
 
 ```sh
-cargo run --release -- --net           # on both machines
+cargo net                              # on both machines
 ```
 
 The two ends do not have to be the same kind of machine. A Linux box and a Mac play
@@ -177,8 +191,8 @@ thrown at it, and throws it straight back. `--net-serve` does the same but puts 
 blob into play to start with.
 
 ```sh
-cargo run --release -- --net-serve &    # invents a blob and throws it at you
-cargo run --release -- --net            # catch it
+cargo net-serve &                       # invents a blob and throws it at you
+cargo net                               # catch it
 ```
 
 That is a complete round trip through real sockets — discovery, throw, catch,
