@@ -2,6 +2,10 @@
 name = "liquid-metal"
 version = "0.1.0"
 edition = "2024"
+description = "A draggable liquid-metal desktop blob you can throw to another machine"
+repository = "https://github.com/VictorGug/liquidMetal"
+# The floor is edition 2024; no dependency asks for more than 1.71.
+rust-version = "1.85"
 
 [features]
 default = ["bundled-sdl"]

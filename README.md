@@ -115,6 +115,35 @@ cargo test                              # 51 unit tests
 cargo run --release -- --selftest       # 8 scripted-simulation assertions
 ```
 
+## Installing it
+
+To have it on your `PATH` rather than running it out of the source tree:
+
+```sh
+cargo install --path .
+liquid-metal --net          # from anywhere
+```
+
+That builds release and drops `liquid-metal` in `~/.cargo/bin`. The binary is
+self-contained — the shader is compiled into it and SDL2 is statically linked, so
+there is nothing beside it to install and nothing it reads from the source
+directory at run time. `cargo uninstall liquid-metal` removes it.
+
+Run it from inside the checkout, as above. Installing straight from the repository
+URL works too, but needs one variable set by hand:
+
+```sh
+CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo install --git https://github.com/VictorGug/liquidMetal
+```
+
+That variable normally comes from `.cargo/config.toml` in the checkout — the vendored
+SDL declares `cmake_minimum_required(VERSION 3.0)` and CMake 4 refuses it — and cargo
+reads its config relative to the directory you are standing in, not the sources it
+cloned. Hence the export when there is no checkout to stand in.
+
+The first install compiles SDL2 from source and takes a minute or two; after that it
+is cached.
+
 ## Controls
 
 | Input | Action |
