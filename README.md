@@ -10,20 +10,82 @@ through to whatever is behind it.
 Runs on **Linux** (X11/XWayland) and **macOS** (Cocoa). The two can throw the blob
 to each other.
 
+## Requirements
+
+**Rust 1.85 or newer.** The crate is edition 2024, which is what sets the floor; no
+dependency asks for more than 1.71. Built and tested on 1.96.1.
+
+**An OpenGL 3.3 core context.** The shader is `#version 330 core`. On the overlay
+path NVIDIA answers with a 4.6 compatibility context instead, for reasons in
+[Transparency](#transparency-the-part-that-is-genuinely-fiddly); the shader runs
+unchanged either way.
+
+### Linux
+
+An **X11 server, or XWayland on `$DISPLAY`** — the overlay is an X11 client and
+refuses to start on any other SDL video driver rather than silently misbehaving. The
+compositor has to composite ARGB windows and honour `_NET_WM_STATE_ABOVE`; KWin
+does, and is what this was developed against.
+
+Building the bundled SDL2 needs **CMake, a C compiler, and the X11 development
+headers**:
+
+```sh
+# Fedora / Nobara
+sudo dnf install cmake gcc libX11-devel libXext-devel libXfixes-devel mesa-libGL-devel
+
+# Debian / Ubuntu
+sudo apt install cmake build-essential libx11-dev libxext-dev libxfixes-dev libgl-dev
+```
+
+The X11 headers are not optional and their absence is quiet: SDL's CMake simply
+builds without an X11 backend, and the first thing you see is the program refusing to
+start because SDL picked some other video driver. There is nothing to install for
+X11 on the Rust side — `x11rb` is pure Rust and needs no C headers.
+
+You do **not** need SDL2 itself, at build time or run time. It is compiled from the
+`sdl2` crate's vendored sources and statically linked, which is the `bundled-sdl`
+feature and is on by default. If you would rather link a system SDL2, install it and
+build with `--no-default-features`.
+
+*Versions this was built against: CMake 4.3.0, GCC 16.1.1, libX11 1.8.13, Mesa 26.1.4
+on Nobara/Fedora 44, KDE Plasma on Wayland with XWayland.* CMake 4 removed
+compatibility with the `cmake_minimum_required(VERSION 3.0)` the vendored SDL
+declares; `.cargo/config.toml` sets `CMAKE_POLICY_VERSION_MINIMUM=3.5` so a plain
+`cargo build` works anyway.
+
+### macOS
+
+```sh
+xcode-select --install     # if you have never built anything on this machine
+brew install cmake
+```
+
+Nothing else — the same bundled SDL2 covers the rest. See
+[`doc/macos.md`](doc/macos.md), and read the note there about what this build has and
+has not been through before trusting it.
+
+### Optional
+
+- **ImageMagick**, only to convert what `--capture` writes into something you can
+  look at: `magick blob.pam blob.png`.
+- **Nothing extra for `--net`.** It uses UDP multicast and TCP over the network you
+  are already on. macOS will ask twice — once for the firewall, once for local
+  network access on macOS 15 and later — and both have to be allowed or throws
+  arrive nowhere.
+
 ## Running it
 
 ```sh
 cargo run --release
 ```
 
-The first build compiles SDL2 from source (~30 s) — there are no SDL development
-headers on this machine, so the `sdl2` crate's `bundled` + `static-link` features
-build it from the vendored sources. That is the `bundled-sdl` feature, on by
-default; `--no-default-features` links a system SDL2 instead.
+The first build compiles SDL2 from the vendored sources and takes a minute or two;
+after that it is cached. See [Requirements](#requirements) for what has to be
+installed, which on Linux is CMake, a C compiler and the X11 development headers.
 
-On a Mac you need `xcode-select --install` and `brew install cmake` first, and then
-the same command. See [`doc/macos.md`](doc/macos.md) — the overlay is a genuinely
-different animal there, and that file is where the differences are written down.
+The overlay is a genuinely different animal on macOS, and
+[`doc/macos.md`](doc/macos.md) is where those differences are written down.
 
 | Flag | What it does |
 | --- | --- |
