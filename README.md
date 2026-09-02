@@ -7,6 +7,9 @@ through to whatever is behind it.
 
 ![the blob](doc/blob.png)
 
+Runs on **Linux** (X11/XWayland) and **macOS** (Cocoa). The two can throw the blob
+to each other.
+
 ## Running it
 
 ```sh
@@ -15,7 +18,12 @@ cargo run --release
 
 The first build compiles SDL2 from source (~30 s) — there are no SDL development
 headers on this machine, so the `sdl2` crate's `bundled` + `static-link` features
-build it from the vendored sources.
+build it from the vendored sources. That is the `bundled-sdl` feature, on by
+default; `--no-default-features` links a system SDL2 instead.
+
+On a Mac you need `xcode-select --install` and `brew install cmake` first, and then
+the same command. See [`doc/macos.md`](doc/macos.md) — the overlay is a genuinely
+different animal there, and that file is where the differences are written down.
 
 | Flag | What it does |
 | --- | --- |
@@ -23,9 +31,11 @@ build it from the vendored sources.
 | `--windowed` | An ordinary opaque window with a checkerboard behind the blob. For working on the renderer without fighting the compositor. |
 | `--capture <path>` | Render a few frames, read the blob back out of the framebuffer, write it to `<path>` as a NetPBM PAM (RGBA, premultiplied), exit. The lever that makes the renderer checkable without looking at a screen. |
 | `--selftest` | Step the physics headlessly through a scripted grab / fling / bounce, print PASS/FAIL per assertion, exit non-zero on failure. |
+| `--net` | Find other machines on the network and turn the screen edges that lead to one into doors. See [Throwing it to another machine](#throwing-it-to-another-machine). |
+| `--net-echo` / `--net-serve` | A headless peer that catches a blob and throws it back. The stand-in for a second computer. |
 
 ```sh
-cargo test                              # 12 physics unit tests
+cargo test                              # 51 unit tests
 cargo run --release -- --selftest       # 8 scripted-simulation assertions
 ```
 
@@ -43,7 +53,143 @@ Because the click-through region *is* the hit test, the app only ever sees a cli
 that lands on the blob. Everything else goes to the apps underneath, so middle-click
 and `Esc` only reach us when we are genuinely the target.
 
+## Throwing it to another machine
+
+Run it with `--net` on two machines and the edges of your screen stop being walls.
+Fling the blob off the right-hand side and it leaves — sliding off the edge, still
+stretched from the throw — and arrives on the other screen a moment later, entering
+from the left at the same height, still deformed, wobbling as it settles. Throw it
+back and you have a game of catch.
+
+```sh
+cargo run --release -- --net           # on both machines
+```
+
+The two ends do not have to be the same kind of machine. A Linux box and a Mac play
+catch with each other; the wire format is defined in absolute terms precisely so
+that they can.
+
+Nothing is configured. Each machine broadcasts a beacon once a second and listens
+for others; with exactly one peer, **every** edge leads to it, which is the case
+worth optimising for. With several, or if you want only one edge to be a door, pin
+them:
+
+```sh
+cargo run --release -- --peer right=othermachine:41521
+```
+
+| Flag | What it does |
+| --- | --- |
+| `--net` | Turn it on. Off by default — it opens a socket, and see the warning below. |
+| `--peer [EDGE=]HOST:PORT` | Name a peer explicitly, optionally pinned to one edge. Implies `--net`. Repeatable. |
+| `--net-group NAME` | Only talk to peers announcing this group, so two pairs can play independently. |
+| `--net-name NAME` | How this machine introduces itself. Defaults to the hostname. |
+| `--no-discovery` | No beacons at all; `--peer` only. |
+| `--net-capacity N` | How many blobs this screen will hold before refusing throws. 1–4. |
+
+### The blob is never in two places, and never in no place
+
+A throw is a **transfer with a receipt**, not a fire-and-forget message. The moment
+the blob crosses the line it would have bounced off, its state goes to the peer over
+TCP — but it stays here, still simulated, still drawn sliding off the edge, until
+the peer says it has it. Only then is the local copy deleted.
+
+Everything else ends with the blob still yours. Refused because the other screen is
+full, connection failed, peer vanished mid-throw, no answer inside 900 ms — all of
+them bounce it back onto your screen, coasting back in under its own power rather
+than being snapped to the wall. **The wall is the fallback.** `--net` cannot lose
+your blob; the worst it can do is not take it.
+
+That is also why the screen holds more than one blob. If a full screen simply
+refused every throw, two people who each had a blob could never pass one to each
+other. Instead a screen holds up to four, and blobs that touch are drawn as one
+metaball field — so two of them meeting flow together into a single pool of mercury
+rather than overlapping like decals, which is the whole reason the blob is made of
+what it is made of.
+
+### Trying it without a second computer
+
+`--net-echo` is a peer with no screen: it joins the network, catches whatever is
+thrown at it, and throws it straight back. `--net-serve` does the same but puts a
+blob into play to start with.
+
+```sh
+cargo run --release -- --net-serve &    # invents a blob and throws it at you
+cargo run --release -- --net            # catch it
+```
+
+That is a complete round trip through real sockets — discovery, throw, catch,
+receipt, return — with one machine and no mouse. Two `--net-echo` instances plus one
+`--net-serve` will play catch with each other indefinitely.
+
+It earns its place for a better reason than convenience, though. The thing at the
+other end of a real throw is expected to be a *different program on a different
+operating system*, so testing this binary against itself would happily pass a broken
+assumption back and forth and never notice. `--net-echo` has no physics, no renderer
+and no window — only the protocol — so anything it can catch and return is defined
+by `wire.rs` rather than by shared code.
+
+### The wire format
+
+`src/wire.rs` is the specification, not an implementation detail, and it is written
+to be implementable from scratch on the other end. The short version:
+
+- Frames are `magic "LQMB" | version u16 | kind u16 | length u32 | payload`.
+  **All integers little-endian, all floats IEEE-754 binary32 little-endian.** A frame
+  whose magic or version does not match is dropped without a reply.
+- **UDP multicast** on `239.255.71.11:47811` carries the once-a-second presence
+  beacon. **TCP**, on an ephemeral port announced in that beacon, carries the throw.
+- Four messages: `Beacon`, `Throw`, `Ack`, `Nack`.
+
+The part worth getting right is the units, because the two screens are different
+sizes. Nothing on the wire is in pixels:
+
+| Quantity | Unit |
+| --- | --- |
+| Position along the edge | a fraction, `0..=1` |
+| Velocity | **screen heights per second**, with *both* components scaled by the receiver's screen height — scaling uniformly rather than x-by-width and y-by-height is what preserves the angle of the throw between screens of different aspect ratios |
+| Satellite offsets and velocities | units of the sender's satellite orbit radius |
+
+What crosses the wire is the gesture, not the geometry. Each end keeps its own blob
+size, and a peer that models its blob with a different number of satellites — or
+none — still gets a throw that lands; it just arrives round instead of wobbling.
+`wire_layout_is_pinned` fails if any offset or field width moves, which is the signal
+to bump `PROTOCOL_VERSION`.
+
+### This is not authenticated
+
+Anyone on your network who speaks the protocol can throw a blob at you or read your
+beacon. There is no key, no handshake and no encryption. That is why none of it runs
+unless you pass `--net`, and `--net-group` is a name rather than a password — it
+scopes discovery so two pairs of machines can play independently, and it is not a
+security boundary. It is a desk toy on a LAN; treat it as one.
+
+## Two platforms, one frame loop
+
+`main.rs` names the platform module `overlay` whichever machine it is built for, and
+both `overlay_x11.rs` and `overlay_mac.rs` provide the same handful of items. The
+frame loop is written once and neither platform is a special case inside it. Where
+the two genuinely differ, the difference is a named constant rather than a `cfg`
+buried in the loop:
+
+| | `overlay_x11.rs` | `overlay_mac.rs` |
+| --- | --- | --- |
+| `IDLE_WAIT_MS` | 66 — the X server wakes us when the pointer touches the blob | 30 — nothing can wake us, so we have to look |
+| `REGION_IS_THE_HIT_TEST` | `true` — a click that arrives already landed on the blob | `false` — the toggle is a frame stale, so test locally too |
+| `NEEDS_VISUAL_STRATEGY` | `true` — a list of ARGB visual strategies to try | `false` — Cocoa composites everything |
+
+The macOS half is type-checked from Linux against the real target, which catches
+everything except runtime behaviour:
+
+```sh
+rustup target add aarch64-apple-darwin
+cargo check-mac
+```
+
 ## The KDE / XWayland assumption
+
+*(Linux only. The macOS equivalent of everything in this section is in
+[`doc/macos.md`](doc/macos.md).)*
 
 This runs as an **X11 client**, on XWayland when your session is Wayland. SDL has no
 Wayland layer-shell support, so an always-on-top click-through overlay is not
@@ -124,15 +270,21 @@ explicitly rather than left for you to discover by looking at a black screen.
 
 ```
 src/main.rs      event loop, fixed-timestep accumulator, GL/visual strategy, wiring
-src/overlay.rs   X11: ARGB visual discovery, EWMH properties, XShape input region
+src/overlay_x11.rs  Linux: ARGB visual discovery, EWMH properties, XShape input region
+src/overlay_mac.rs  macOS: Cocoa window properties, GL surface opacity, click-through
 src/physics.rs   blob soft-body sim; pure, no SDL/GL/X types, unit-tested
 src/render.rs    GL context, shader compile, uniform upload, draw, framebuffer readback
 src/shader.frag  the metal shader
+src/wire.rs      the over-the-wire contract for a throw: bytes in, values out
+src/net.rs       sockets and threads: discovery, hand-off, receipts
 src/selftest.rs  the scripted --selftest run
 ```
 
 `physics.rs` has no SDL, GL or X dependency at all. It is the only part that can be
-exercised headlessly, so it is kept that way on purpose.
+exercised headlessly, so it is kept that way on purpose — and `wire.rs` is held to
+the same standard for the same reason, which is why the protocol is covered by
+sixteen unit tests that never open a socket. `net.rs` is where the blocking lives,
+and its own tests bind real ones.
 
 ## How it works
 
@@ -143,6 +295,14 @@ Neither is faked separately. Dragging drives the core with a stiff damped spring
 rather than teleporting it — the lag is the good part. Release velocity is averaged
 over the last 80 ms of pointer track, which is most of what makes flinging feel good.
 Simulation runs at a fixed 240 Hz regardless of frame rate.
+
+**Several blobs at once.** A screen holds up to four, because a screen that could
+only ever hold one would have to refuse every throw from someone who also had one.
+Blobs whose bounding boxes touch are shaded in a single pass, so they share one
+metaball field and flow together instead of overlapping; blobs far apart get their
+own pass scissored to their own corner and cost exactly what one blob always cost.
+The ceiling is the shader's ball budget, `render::MAX_BLOBS`, since a whole clump has
+to fit in one draw.
 
 **Click-through.** The XShape `ShapeInput` region is recomputed each frame by
 rasterising the field onto a 14 px grid, thresholding below the visible isosurface,
@@ -212,6 +372,22 @@ cargo run --release -- --capture /tmp/blob.pam && magick /tmp/blob.pam /tmp/blob
   to the visible part of the window and cannot be dragged onto monitors the window
   does not cover. KWin relents on retry here, so this is a fallback rather than the
   normal path; the startup log says which happened.
+- **The macOS overlay has been type-checked but never run.** It was written on
+  Linux against the `aarch64-apple-darwin` target, so the Objective-C message
+  signatures and the SDL bindings are checked by the compiler — but nothing has
+  linked it or put a window on a screen. `doc/macos.md` lists what is most likely to
+  be wrong on a first run and what to do about each.
+- **There is no Windows overlay.** The protocol is free of anything
+  platform-specific and `--net-echo` proves it can be spoken by a program that is
+  not this one, so a third platform needs only its own `overlay_*.rs`: a
+  transparent, always-on-top, click-through-except-on-the-blob window. Everything
+  else already ports.
+- **A blob in flight when you quit is gone.** If you close the program in the
+  fraction of a second between the blob leaving and the receipt arriving, and the
+  peer had in fact taken it, the peer keeps it — which is correct. If the peer had
+  not, nobody has it. It is one blob and a double-click makes another.
+- **Nothing on the network is authenticated.** See above; `--net` is opt-in for
+  precisely this reason.
 - **Keyboard focus.** The window asks not to take focus on map (`_NET_WM_USER_TIME`
   of 0 plus SDL's `SDL_WINDOW_NO_ACTIVATION_WHEN_SHOWN`), which means `Esc` only
   works once you have clicked the blob. Middle-click and `Ctrl+C` always work.

@@ -9,6 +9,108 @@
 //! not there. `ShapeBounding` would also work as a hit test, but it clips the
 //! rendered pixels too, which would hard-edge the antialiased rim — so: input only.
 
+
+// ---------------------------------------------------------------------------
+// The surface every platform's overlay has to provide.
+//
+// `main.rs` names this module `overlay` whichever platform it is built for, and
+// calls only the items below plus the inherent methods on `Overlay`. The macOS
+// twin of this file, `overlay_mac.rs`, provides exactly the same set — so the
+// frame loop is written once and neither platform is a special case inside it.
+// ---------------------------------------------------------------------------
+
+/// What `main.rs` calls the thing that holds the window on the desktop.
+pub type Overlay = X11;
+
+/// Anything that has to be true of the process before SDL initialises.
+///
+/// SDL has no Wayland layer-shell support, so an always-on-top click-through
+/// overlay is not reachable from a Wayland-native surface. Force the X11 backend
+/// (XWayland) before SDL_Init looks at the environment.
+pub fn prepare_process_environment() {
+    // SAFETY: called from `run` before SDL or any thread of ours exists, so
+    // nothing can be reading the environment concurrently.
+    unsafe {
+        std::env::set_var("SDL_VIDEODRIVER", "x11");
+        // And drop WAYLAND_DISPLAY for our own process only. Forcing SDL's video
+        // driver is not enough: EGL picks its *platform* by sniffing the
+        // environment, so with WAYLAND_DISPLAY still set it selects the Wayland
+        // platform, hands the display off to libnvidia-egl-wayland, and that
+        // segfaults inside wl_proxy_create_wrapper because we never made a Wayland
+        // connection. Removing it makes EGL choose the X11 platform, matching the
+        // X11 window we are actually creating.
+        std::env::remove_var("WAYLAND_DISPLAY");
+        // Belt and braces for the same problem: SDL 2.26's X11 loader passes
+        // platform 0 to eglGetPlatformDisplay, and the vendor loader then guesses.
+        // We do not ask for EGL, but if anything ever does, this keeps it on X11.
+        std::env::set_var("EGL_PLATFORM", "x11");
+    }
+}
+
+/// Frame budget while the blob is asleep: ~15 fps.
+///
+/// The XShape input region means the X server wakes us the instant the pointer
+/// touches the blob, so idling this slowly costs nothing in responsiveness.
+pub const IDLE_WAIT_MS: u32 = 66;
+
+/// The input region *is* the hit test here: a click that reaches this process
+/// already landed on the blob.
+pub const REGION_IS_THE_HIT_TEST: bool = true;
+
+/// Getting a transparent window means choosing an X visual by hand and checking
+/// what the driver did with it, so the overlay has a list of strategies to try.
+pub const NEEDS_VISUAL_STRATEGY: bool = true;
+
+/// The SDL video driver this overlay can actually work with.
+pub const REQUIRED_VIDEO_DRIVER: &str = "x11";
+
+pub fn check_video_driver(driver: &str) -> Result<(), String> {
+    if driver == REQUIRED_VIDEO_DRIVER {
+        return Ok(());
+    }
+    Err(format!(
+        "SDL chose the {driver:?} video driver, but liquidMetal needs \
+         {REQUIRED_VIDEO_DRIVER:?} here.\n\
+         The overlay relies on X11 features (ARGB visuals, EWMH, XShape) that have \
+         no SDL-reachable equivalent on Wayland.\n\
+         Check that an X server or XWayland is running on $DISPLAY."
+    ))
+}
+
+/// Pull the native window handle out of SDL: on X11, the window id.
+///
+/// Route (a) from the two available: `SDL_GetWindowWMInfo` with a version-stamped
+/// `SDL_SysWMinfo`. Chosen over the `raw-window-handle` route because that one
+/// panics internally when the query fails, and window setup is exactly where a
+/// panic is least useful.
+pub fn native_window_handle(window: &sdl2::video::Window) -> Result<u64, String> {
+    // SAFETY: `info` is a plain C struct with no invalid bit patterns for the fields
+    // SDL reads, the version is stamped before the call as SDL requires, and
+    // `window.raw()` is a live SDL_Window for the lifetime of the borrow.
+    unsafe {
+        let mut info: sdl2::sys::SDL_SysWMinfo = std::mem::zeroed();
+        sdl2::sys::SDL_GetVersion(&mut info.version);
+        if sdl2::sys::SDL_GetWindowWMInfo(window.raw(), &mut info) != sdl2::sys::SDL_bool::SDL_TRUE
+        {
+            return Err(format!(
+                "SDL_GetWindowWMInfo failed: {}\n\
+                 Without the X window id the overlay cannot set its EWMH properties \
+                 or its click-through input region.",
+                sdl2::get_error()
+            ));
+        }
+        if info.subsystem != sdl2::sys::SDL_SYSWM_TYPE::SDL_SYSWM_X11 {
+            return Err(format!(
+                "the SDL window is not an X11 window (SDL_SYSWM_TYPE = {}).\n\
+                 liquidMetal must run as an X11 client; set DISPLAY and make sure \
+                 XWayland is available.",
+                info.subsystem as u32
+            ));
+        }
+        Ok(info.info.x11.window as u64)
+    }
+}
+
 use x11rb::connection::Connection;
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::shape::{self, ConnectionExt as _, SK, SO};
@@ -100,6 +202,29 @@ pub struct X11 {
 impl X11 {
     /// Connect to `$DISPLAY` and gather everything the caller needs *before* the
     /// window exists — notably the virtual screen size.
+    /// The whole desktop, in logical pixels: how big the overlay window has to be.
+    pub fn desktop_size(&self) -> (u32, u32) {
+        (self.virtual_w as u32, self.virtual_h as u32)
+    }
+
+    /// The X root window is the origin, always.
+    pub fn desktop_origin(&self) -> (i32, i32) {
+        (0, 0)
+    }
+
+    /// Nothing to do once GL is up: the window's visual was settled before it was
+    /// created, and that is the whole of transparency on X11.
+    pub fn on_gl_context_ready(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Nothing to do here: the X server told us the virtual screen at `connect`
+    /// time, before SDL existed. macOS cannot answer until SDL's video subsystem is
+    /// up, which is why this step exists at all.
+    pub fn probe_desktop(&mut self, _video: &sdl2::VideoSubsystem) -> Result<(), String> {
+        Ok(())
+    }
+
     pub fn connect() -> Result<X11, String> {
         let (conn, screen_num) = x11rb::connect(None).map_err(|e| {
             format!(
@@ -308,6 +433,79 @@ impl X11 {
 
     /// The depth X actually gave the window. Anything other than 32 in overlay mode
     /// means there is no alpha channel and the window will composite as opaque.
+    /// The platform-specific half of the startup diagnostics, as label/value pairs.
+    ///
+    /// Everything here is *read back from the X server* rather than assumed: what
+    /// SDL asked for and what it got differ in exactly the ways that make an
+    /// overlay fail silently, so the log states the truth and says so loudly when
+    /// the truth is wrong.
+    pub fn describe(&self, xid: u64) -> Vec<(&'static str, String)> {
+        let mut out = Vec::new();
+        out.push(("window XID", format!("{xid:#010x} ({xid})")));
+        match self.window_rect() {
+            Ok((wx, wy, ww, wh)) => out.push((
+                "window on screen",
+                format!(
+                    "{ww} x {wh} at ({wx}, {wy}){}",
+                    if (wx, wy) == (0, 0)
+                        && (ww, wh) == (self.virtual_w as u32, self.virtual_h as u32)
+                    {
+                        "  [matches the virtual screen]"
+                    } else {
+                        "  <-- NOT the full virtual screen"
+                    }
+                ),
+            )),
+            Err(e) => out.push(("window on screen", format!("unknown ({e})"))),
+        }
+        // The authoritative transparency check: GL alpha bits are not enough, the X
+        // window itself has to be depth 32.
+        match self.window_depth() {
+            Ok(32) => out.push((
+                "X window depth",
+                format!(
+                    "32  <-- ARGB visual {}, alpha channel present",
+                    self.argb_visual
+                        .map(|v| format!("{v:#x}"))
+                        .unwrap_or_else(|| "(SDL's choice)".into())
+                ),
+            )),
+            Ok(d) => out.push((
+                "X window depth",
+                format!("{d}  <-- NO ALPHA CHANNEL: the overlay will be opaque"),
+            )),
+            Err(e) => out.push(("X window depth", format!("unknown ({e})"))),
+        }
+        out.push((
+            "XShape version",
+            format!("{}.{}", self.shape_version.0, self.shape_version.1),
+        ));
+        out.push((
+            "X virtual screen",
+            format!("{} x {} at (0, 0)", self.virtual_w, self.virtual_h),
+        ));
+        if self.monitors.is_empty() {
+            out.push(("monitors", "(RandR 1.5 GetMonitors unavailable)".into()));
+        } else {
+            for m in &self.monitors {
+                out.push((
+                    "monitor",
+                    format!(
+                        "{:<12} {:>5} x {:<5} at ({:>5}, {:>5}){}",
+                        m.name,
+                        m.width,
+                        m.height,
+                        m.x,
+                        m.y,
+                        if m.primary { "  [primary]" } else { "" }
+                    ),
+                ));
+            }
+        }
+        out.push(("input region", "empty (whole window click-through)".into()));
+        out
+    }
+
     pub fn window_depth(&self) -> Result<u8, String> {
         self.depth_of(self.win()? as u64)
     }

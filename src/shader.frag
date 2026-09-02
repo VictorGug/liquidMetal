@@ -16,7 +16,7 @@ out vec4 fragColor;
 uniform vec2  uResolution;   // drawable size in pixels
 uniform float uTime;         // seconds since start
 uniform int   uCount;        // active entries in uBlobs
-uniform vec4  uBlobs[16];    // xy = centre in top-down pixels, z = radius, w = strength
+uniform vec4  uBlobs[40];    // xy = centre in top-down pixels, z = radius, w = strength
 uniform int   uOpaque;       // 1 in --windowed: composite over a checkerboard instead
 
 // --------------------------------------------------------------------------

@@ -1,7 +1,9 @@
 //! Soft-body blob simulation.
 //!
 //! Deliberately free of every SDL / GL / X11 type: this is the only part of the
-//! program that can be exercised headlessly, so it has to stay that way.
+//! program that can be exercised headlessly, so it has to stay that way. It does
+//! name `wire::Edge`, which is pure data and just as headless — better one shared
+//! enum than two identical ones and a conversion between them.
 //!
 //! Model: one heavy `core` particle plus `SAT_COUNT` satellites, each spring-attached
 //! to a rest offset on a circle around the core. Rendering unions all of them as a
@@ -9,6 +11,8 @@
 //! and their spring ring-down *is* the wobble. Neither is faked separately.
 
 use std::f32::consts::TAU;
+
+use crate::wire::Edge;
 
 // ---------------------------------------------------------------------------
 // TUNABLES — everything you would touch to change how the blob feels lives here.
@@ -85,6 +89,19 @@ pub const SUBSTEP: f32 = 1.0 / 240.0;
 /// Never let the accumulator ask for more than this much simulated time in one frame,
 /// so a stall (or a laptop resuming from sleep) cannot spiral.
 pub const MAX_FRAME_TIME: f32 = 0.25;
+
+// --- leaving the screen for another machine ---
+/// Slowest a blob may be travelling as it arrives from a peer, in px/s.
+///
+/// A throw arrives just outside the edge and has to coast *in*. Too slow and it
+/// hangs off the side of the screen; a peer sending an outward or near-zero
+/// velocity — buggy, or just a very gentle throw across mismatched screens — would
+/// otherwise leave the blob stranded where nobody can grab it.
+pub const MIN_ENTRY_SPEED: f32 = 150.0;
+
+/// How far outside the edge an arriving blob starts, in units of `COLLIDE_RADIUS`.
+/// Far enough that it visibly slides on rather than popping into existence.
+pub const ENTRY_MARGIN: f32 = 1.15;
 
 // --- input-region rasterisation ---
 /// Cell size in pixels of the coarse grid used to build the XShape input region.
@@ -271,6 +288,16 @@ pub struct Blob {
     grab_target: Vec2,
     /// Seconds since the blob last moved meaningfully; drives the idle throttle.
     pub still_for: f32,
+    /// Bitmask of `Edge`s that lead to another machine. Those stop being walls: the
+    /// blob passes straight through and the frame loop turns that into a throw.
+    portals: u8,
+    /// True while the blob is outside its own bounds *on its way in* — freshly
+    /// arrived from a peer, or bounced back after a throw that did not connect.
+    ///
+    /// One flag for both cases, because they are the same situation: something is
+    /// out there heading inward and must not be mistaken for something leaving.
+    /// Cleared by `step` the moment the core is properly inside.
+    entering: bool,
 }
 
 impl Blob {
@@ -289,8 +316,72 @@ impl Blob {
             grab: None,
             grab_target: c,
             still_for: 0.0,
+            portals: 0,
+            entering: false,
         };
         b.snap_satellites();
+        b
+    }
+
+    /// A blob arriving from another machine, placed just outside `edge` and moving
+    /// inward, carrying the deformation it was thrown with.
+    ///
+    /// `along` is the 0..=1 position along that edge, `vel` is already in this
+    /// machine's pixels per second, and `sats` are offsets and relative velocities
+    /// in units of `SAT_ORBIT` — see `wire.rs` for why those are the units.
+    pub fn arriving(
+        bounds: Bounds,
+        edge: Edge,
+        along: f32,
+        vel: Vec2,
+        sats: &[crate::wire::SatState],
+    ) -> Blob {
+        let mut b = Blob::new(bounds);
+        let along = along.clamp(0.0, 1.0);
+        let m = COLLIDE_RADIUS * ENTRY_MARGIN;
+        let (w, h) = (bounds.x1 - bounds.x0, bounds.y1 - bounds.y0);
+        b.core.p = match edge {
+            Edge::Left => v2(bounds.x0 - m, bounds.y0 + along * h),
+            Edge::Right => v2(bounds.x1 + m, bounds.y0 + along * h),
+            Edge::Top => v2(bounds.x0 + along * w, bounds.y0 - m),
+            Edge::Bottom => v2(bounds.x0 + along * w, bounds.y1 + m),
+        };
+
+        // The inward normal of the edge it is coming through.
+        let n = match edge {
+            Edge::Left => v2(1.0, 0.0),
+            Edge::Right => v2(-1.0, 0.0),
+            Edge::Top => v2(0.0, 1.0),
+            Edge::Bottom => v2(0.0, -1.0),
+        };
+        // Whatever the peer sent, it has to be heading onto this screen fast enough
+        // to get here. Anything else strands the blob off the edge.
+        let mut v = if vel.is_finite() { vel } else { v2(0.0, 0.0) };
+        let inward = v.dot(n);
+        if inward < 0.0 {
+            v -= n * (2.0 * inward); // reflect, keeping the tangential component
+        }
+        let inward = v.dot(n);
+        if inward < MIN_ENTRY_SPEED {
+            v += n * (MIN_ENTRY_SPEED - inward);
+        }
+        b.core.v = v;
+
+        b.snap_satellites();
+        // Re-apply the thrown shape on top of the rest pose. A peer that models its
+        // blob differently sends a different count (or none); then the blob simply
+        // arrives round, which is a worse throw but still a throw.
+        if sats.len() == SAT_COUNT {
+            for (i, s) in sats.iter().enumerate() {
+                let off = v2(s.off_x, s.off_y) * SAT_ORBIT;
+                let rel = v2(s.vel_x, s.vel_y) * SAT_ORBIT;
+                if off.is_finite() && rel.is_finite() && off.len() <= MAX_SAT_DIST {
+                    b.sats[i].p = b.core.p + off;
+                    b.sats[i].v = b.core.v + rel;
+                }
+            }
+        }
+        b.entering = true;
         b
     }
 
@@ -312,11 +403,130 @@ impl Blob {
         self.grab = None;
         self.grab_target = self.core.p;
         self.still_for = 0.0;
+        self.entering = false;
         self.snap_satellites();
     }
 
     pub fn set_bounds(&mut self, b: Bounds) {
         self.bounds = b;
+    }
+
+    /// Set which edges are doors rather than walls.
+    pub fn set_portals(&mut self, mask: u8) {
+        self.portals = mask;
+    }
+
+    /// Read only by the tests — which is the point of it. Asserting on the mask is
+    /// how they check that a door was opened where one was asked for.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn portals(&self) -> u8 {
+        self.portals
+    }
+
+    fn portal_open(&self, e: Edge) -> bool {
+        self.portals & e.bit() != 0
+    }
+
+    /// True while the blob is outside the screen heading in. Also test-facing: the
+    /// arrival tests need to see the flag clear on its own once the blob is in.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn is_entering(&self) -> bool {
+        self.entering
+    }
+
+    /// The portal edge this blob has just left through, if any.
+    ///
+    /// The test is the *same line* an ordinary wall bounce happens at, so a portal
+    /// is exactly a bounce that was allowed to continue. A blob on its way in is
+    /// never leaving, however far outside it currently is — that is what
+    /// `entering` is for.
+    pub fn departing_edge(&self) -> Option<Edge> {
+        if self.entering || self.grab.is_some() {
+            return None;
+        }
+        let r = COLLIDE_RADIUS;
+        let b = self.bounds;
+        let (p, v) = (self.core.p, self.core.v);
+        let candidates = [
+            (Edge::Left, p.x < b.x0 + r, v.x < 0.0),
+            (Edge::Right, p.x > b.x1 - r, v.x > 0.0),
+            (Edge::Top, p.y < b.y0 + r, v.y < 0.0),
+            (Edge::Bottom, p.y > b.y1 - r, v.y > 0.0),
+        ];
+        candidates
+            .iter()
+            .find(|(e, past, outward)| *past && *outward && self.portal_open(*e))
+            .map(|(e, _, _)| *e)
+    }
+
+    /// Where along `edge` the core is, as a 0..=1 fraction. This is what crosses
+    /// the wire, so the blob turns up at the same height on a screen of a different
+    /// size.
+    pub fn along_edge(&self, edge: Edge) -> f32 {
+        let b = self.bounds;
+        let (w, h) = (b.x1 - b.x0, b.y1 - b.y0);
+        let f = match edge {
+            Edge::Left | Edge::Right => {
+                if h > 1e-3 { (self.core.p.y - b.y0) / h } else { 0.5 }
+            }
+            Edge::Top | Edge::Bottom => {
+                if w > 1e-3 { (self.core.p.x - b.x0) / w } else { 0.5 }
+            }
+        };
+        f.clamp(0.0, 1.0)
+    }
+
+    /// Satellite offsets and velocities relative to the core, in units of
+    /// `SAT_ORBIT`, ready for the wire.
+    pub fn sat_states(&self) -> Vec<crate::wire::SatState> {
+        let inv = 1.0 / SAT_ORBIT;
+        self.sats
+            .iter()
+            .map(|s| {
+                let off = (s.p - self.core.p) * inv;
+                let rel = (s.v - self.core.v) * inv;
+                crate::wire::SatState {
+                    off_x: off.x,
+                    off_y: off.y,
+                    vel_x: rel.x,
+                    vel_y: rel.y,
+                }
+            })
+            .collect()
+    }
+
+    /// Turn a departure back into a bounce, because the throw did not connect.
+    ///
+    /// The blob is outside the screen by now, so it is not snapped back to the wall
+    /// — that would be a visible teleport. Its outward velocity is reversed and it
+    /// is marked as entering, so it coasts back on under its own power and reads as
+    /// a bounce that took a moment to happen.
+    pub fn bounce_back(&mut self, edge: Edge) {
+        let n = match edge {
+            Edge::Left => v2(1.0, 0.0),
+            Edge::Right => v2(-1.0, 0.0),
+            Edge::Top => v2(0.0, 1.0),
+            Edge::Bottom => v2(0.0, -1.0),
+        };
+        let inward = self.core.v.dot(n);
+        if inward < 0.0 {
+            self.core.v -= n * (inward * (1.0 + RESTITUTION));
+        }
+        let inward = self.core.v.dot(n);
+        if inward < MIN_ENTRY_SPEED {
+            self.core.v += n * (MIN_ENTRY_SPEED - inward);
+        }
+        self.entering = true;
+        self.still_for = 0.0;
+    }
+
+    /// True once the blob is far enough outside that none of it is on screen. The
+    /// frame loop stops drawing it and stops stepping it at this point, so a throw
+    /// still waiting for its receipt does not coast off to infinity.
+    pub fn is_off_screen(&self) -> bool {
+        let bb = self.bbox();
+        let b = self.bounds;
+        bb.x1 < b.x0 || bb.x0 > b.x1 || bb.y1 < b.y0 || bb.y0 > b.y1
     }
 
     pub fn is_grabbed(&self) -> bool {
@@ -388,6 +598,20 @@ impl Blob {
         }
         self.core.p += self.core.v * dt;
 
+        // Once a blob that was on its way in is properly inside, it is an ordinary
+        // blob again — and only then may it be considered to be leaving. Using the
+        // bounce line rather than the screen edge means it has to be clear of the
+        // door before the door can be used again, so an arrival cannot bounce
+        // straight back out the way it came.
+        if self.entering {
+            let r = COLLIDE_RADIUS;
+            let b = self.bounds;
+            let p = self.core.p;
+            if p.x >= b.x0 + r && p.x <= b.x1 - r && p.y >= b.y0 + r && p.y <= b.y1 - r {
+                self.entering = false;
+            }
+        }
+
         self.collide_walls();
 
         // --- satellites ---
@@ -434,27 +658,31 @@ impl Blob {
         // Degenerate screens (narrower than the blob) would otherwise ping-pong.
         if hi_x <= lo_x || hi_y <= lo_y {
             self.core.p = self.bounds.center();
+            self.entering = false;
             return;
         }
 
+        // An edge that leads to another machine is not a wall. The blob sails
+        // straight through the line it would have bounced off, and `departing_edge`
+        // — which tests that same line — turns that into a throw.
         let mut hit: Option<(Vec2, f32)> = None;
-        if self.core.p.x < lo_x {
+        if self.core.p.x < lo_x && !self.portal_open(Edge::Left) {
             let impact = (-self.core.v.x).max(0.0);
             self.core.p.x = lo_x;
             self.core.v.x = self.core.v.x.abs() * RESTITUTION;
             hit = Some((v2(1.0, 0.0), impact));
-        } else if self.core.p.x > hi_x {
+        } else if self.core.p.x > hi_x && !self.portal_open(Edge::Right) {
             let impact = self.core.v.x.max(0.0);
             self.core.p.x = hi_x;
             self.core.v.x = -self.core.v.x.abs() * RESTITUTION;
             hit = Some((v2(-1.0, 0.0), impact));
         }
-        if self.core.p.y < lo_y {
+        if self.core.p.y < lo_y && !self.portal_open(Edge::Top) {
             let impact = (-self.core.v.y).max(0.0);
             self.core.p.y = lo_y;
             self.core.v.y = self.core.v.y.abs() * RESTITUTION;
             hit = Some((v2(0.0, 1.0), impact));
-        } else if self.core.p.y > hi_y {
+        } else if self.core.p.y > hi_y && !self.portal_open(Edge::Bottom) {
             let impact = self.core.v.y.max(0.0);
             self.core.p.y = hi_y;
             self.core.v.y = -self.core.v.y.abs() * RESTITUTION;
@@ -866,5 +1094,257 @@ mod tests {
         let b = Blob::new(screen());
         assert!(b.field(b.core.p) > 1.0);
         assert!(b.field(b.core.p + v2(1000.0, 0.0)) < 1.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Doors instead of walls
+    // -----------------------------------------------------------------------
+
+    /// A blob thrown at the right-hand edge with no peer there. The old behaviour,
+    /// and the one every failure mode has to fall back to.
+    #[test]
+    fn an_edge_with_nobody_behind_it_is_still_a_wall() {
+        let mut b = Blob::new(screen());
+        b.core.v = v2(3000.0, 0.0);
+        assert_eq!(b.portals(), 0);
+        // Containment at every step, not just at the end: by the time it settles it
+        // has bounced off both sides, so the final velocity says nothing.
+        for _ in 0..2400 {
+            b.step(SUBSTEP);
+            assert_eq!(b.departing_edge(), None, "nowhere to go, so it cannot be leaving");
+            assert!(
+                b.core.p.x <= screen().x1 - COLLIDE_RADIUS + 1e-3
+                    && b.core.p.x >= screen().x0 + COLLIDE_RADIUS - 1e-3,
+                "the blob went through a wall to {:?}",
+                b.core.p
+            );
+        }
+        assert!(b.is_at_rest(), "it should have settled");
+    }
+
+    /// The same throw, with a peer on the right. The blob sails through the line it
+    /// would have bounced off.
+    #[test]
+    fn an_edge_with_a_peer_behind_it_is_a_door() {
+        let mut b = Blob::new(screen());
+        b.set_portals(Edge::Right.bit());
+        b.core.v = v2(3000.0, 0.0);
+
+        let mut left_by = None;
+        for _ in 0..600 {
+            b.step(SUBSTEP);
+            if left_by.is_none() {
+                left_by = b.departing_edge();
+            }
+        }
+        assert_eq!(left_by, Some(Edge::Right), "it never went through the door");
+        assert!(b.all_finite());
+        assert!(
+            b.core.p.x > screen().x1 - COLLIDE_RADIUS,
+            "it is still inside at {:?}",
+            b.core.p
+        );
+        // Given long enough it is genuinely gone, so the frame loop can stop drawing it.
+        for _ in 0..600 {
+            b.step(SUBSTEP);
+        }
+        assert!(b.is_off_screen(), "bbox {:?} still overlaps the screen", b.bbox());
+    }
+
+    /// Only the edge that was opened is a door. The other three still bounce.
+    #[test]
+    fn a_door_on_one_edge_does_not_open_the_others() {
+        let mut b = Blob::new(screen());
+        b.set_portals(Edge::Right.bit());
+        b.core.v = v2(0.0, -3000.0);
+        for _ in 0..600 {
+            b.step(SUBSTEP);
+        }
+        assert_eq!(b.departing_edge(), None);
+        assert!(b.core.p.y >= screen().y0 + COLLIDE_RADIUS - 1e-3, "went out the top");
+    }
+
+    /// A blob being dragged is not leaving, however far past the edge the pointer
+    /// goes — otherwise it would shoot off to the neighbour mid-drag.
+    #[test]
+    fn a_held_blob_never_goes_through_a_door() {
+        let mut b = Blob::new(screen());
+        b.set_portals(0xf);
+        b.grab(b.core.p);
+        b.drag_to(v2(5000.0, 540.0));
+        for _ in 0..600 {
+            b.step(SUBSTEP);
+            assert_eq!(b.departing_edge(), None, "it left while it was being held");
+        }
+    }
+
+    #[test]
+    fn along_edge_reports_where_it_crossed() {
+        let mut b = Blob::new(screen());
+        b.core.p = v2(1000.0, 270.0); // a quarter of the way down a 1080 screen
+        assert!((b.along_edge(Edge::Right) - 0.25).abs() < 1e-4);
+        b.core.p = v2(480.0, 500.0); // a quarter of the way across a 1920 screen
+        assert!((b.along_edge(Edge::Top) - 0.25).abs() < 1e-4);
+    }
+
+    /// An arriving blob starts outside and has to get itself on screen.
+    #[test]
+    fn an_arriving_blob_comes_onto_the_screen() {
+        let mut b = Blob::arriving(screen(), Edge::Left, 0.25, v2(900.0, 0.0), &[]);
+        assert!(b.is_entering());
+        assert!(b.core.p.x < screen().x0, "it should start outside, not at {:?}", b.core.p);
+        assert!((b.core.p.y - 270.0).abs() < 1.0, "it came in at the wrong height");
+
+        for _ in 0..600 {
+            b.step(SUBSTEP);
+        }
+        assert!(b.all_finite());
+        assert!(!b.is_entering(), "it never finished arriving");
+        assert!(b.core.p.x > screen().x0 + COLLIDE_RADIUS, "still outside at {:?}", b.core.p);
+    }
+
+    /// While it is on its way in it must not be mistaken for something on its way
+    /// out — otherwise a caught blob is instantly thrown back and the two machines
+    /// play the blob like a hot potato forever.
+    #[test]
+    fn an_arriving_blob_is_not_immediately_thrown_back() {
+        let mut b = Blob::arriving(screen(), Edge::Left, 0.5, v2(900.0, 0.0), &[]);
+        b.set_portals(0xf);
+        for _ in 0..600 {
+            assert_eq!(b.departing_edge(), None, "it turned round and left again");
+            b.step(SUBSTEP);
+            if !b.is_entering() {
+                return;
+            }
+        }
+        panic!("it never got inside");
+    }
+
+    /// A peer that sends a velocity pointing the wrong way — buggy, or just a very
+    /// soft throw between mismatched screens — must not strand the blob off the
+    /// edge where nobody can reach it.
+    #[test]
+    fn a_throw_that_arrives_pointing_the_wrong_way_still_lands() {
+        for (edge, bad) in [
+            (Edge::Left, v2(-900.0, 0.0)),
+            (Edge::Right, v2(900.0, 0.0)),
+            (Edge::Top, v2(0.0, -900.0)),
+            (Edge::Bottom, v2(0.0, 900.0)),
+            (Edge::Left, v2(0.0, 0.0)),
+        ] {
+            let mut b = Blob::arriving(screen(), edge, 0.5, bad, &[]);
+            for _ in 0..1200 {
+                b.step(SUBSTEP);
+            }
+            assert!(!b.is_entering(), "{edge:?} with {bad:?} never came on screen");
+            assert!(b.all_finite());
+        }
+    }
+
+    /// The wobble has to survive the trip. This is the whole point of putting the
+    /// satellites on the wire: the blob turns up still deformed by the throw.
+    #[test]
+    fn the_thrown_shape_survives_the_round_trip() {
+        let mut sent = Blob::new(screen());
+        sent.core.v = v2(1800.0, -600.0);
+        sent.grab(sent.core.p);
+        sent.drag_to(v2(1400.0, 300.0));
+        for _ in 0..120 {
+            sent.step(SUBSTEP);
+        }
+        sent.release(v2(1800.0, -600.0));
+        for _ in 0..30 {
+            sent.step(SUBSTEP);
+        }
+
+        let states = sent.sat_states();
+        assert_eq!(states.len(), SAT_COUNT);
+        let deformed = states.iter().any(|s| {
+            (v2(s.off_x, s.off_y).len() - 1.0).abs() > 0.05 || v2(s.vel_x, s.vel_y).len() > 0.05
+        });
+        assert!(deformed, "the test did not actually deform the blob, so it proves nothing");
+
+        let got = Blob::arriving(screen(), Edge::Left, 0.5, v2(1800.0, -600.0), &states);
+        for (i, s) in states.iter().enumerate() {
+            let off = (got.sats[i].p - got.core.p) * (1.0 / SAT_ORBIT);
+            let rel = (got.sats[i].v - got.core.v) * (1.0 / SAT_ORBIT);
+            assert!(
+                (off - v2(s.off_x, s.off_y)).len() < 1e-4,
+                "satellite {i} arrived at the wrong offset"
+            );
+            assert!((rel - v2(s.vel_x, s.vel_y)).len() < 1e-4, "satellite {i} lost its motion");
+        }
+    }
+
+    /// A peer that models its blob with a different number of satellites, or none
+    /// at all, still gets a landed throw — just a round one.
+    #[test]
+    fn a_throw_from_a_differently_shaped_peer_still_lands() {
+        for n in [0usize, 3, SAT_COUNT + 5] {
+            let junk = vec![crate::wire::SatState { off_x: 9.0, off_y: 9.0, ..Default::default() }; n];
+            let mut b = Blob::arriving(screen(), Edge::Top, 0.5, v2(0.0, 900.0), &junk);
+            for _ in 0..1200 {
+                b.step(SUBSTEP);
+            }
+            assert!(b.all_finite(), "{n} satellites produced a broken blob");
+            assert!(b.max_sat_dist() <= MAX_SAT_DIST + 1e-3);
+            assert!(!b.is_entering());
+        }
+    }
+
+    /// The throw did not connect. The blob has to come back on screen under its own
+    /// power rather than being teleported to the wall.
+    #[test]
+    fn a_throw_that_is_refused_bounces_the_blob_back_in() {
+        let mut b = Blob::new(screen());
+        b.set_portals(Edge::Right.bit());
+        b.core.v = v2(3000.0, 0.0);
+        let mut edge = None;
+        while edge.is_none() {
+            b.step(SUBSTEP);
+            edge = b.departing_edge();
+        }
+        // Let it get properly outside, the way a real one would while waiting.
+        for _ in 0..120 {
+            b.step(SUBSTEP);
+        }
+        let outside = b.core.p;
+        assert!(outside.x > screen().x1);
+
+        b.bounce_back(Edge::Right);
+        assert!(b.is_entering());
+        assert_eq!(b.core.p, outside, "bouncing back must not teleport it");
+        assert!(b.core.v.x < 0.0, "it should be heading back in");
+
+        for _ in 0..2400 {
+            b.step(SUBSTEP);
+        }
+        assert!(b.all_finite());
+        assert!(!b.is_entering(), "it never made it back");
+        assert!(b.core.p.x < screen().x1 - COLLIDE_RADIUS + 1e-3);
+    }
+
+    /// Closing the door under a blob that is already outside must not lose it: the
+    /// walls catch it and put it back.
+    #[test]
+    fn a_peer_vanishing_mid_throw_does_not_lose_the_blob() {
+        let mut b = Blob::new(screen());
+        b.set_portals(Edge::Right.bit());
+        b.core.v = v2(3000.0, 0.0);
+        for _ in 0..400 {
+            b.step(SUBSTEP);
+        }
+        assert!(b.core.p.x > screen().x1 - COLLIDE_RADIUS);
+
+        b.set_portals(0); // the peer went away
+        for _ in 0..2400 {
+            b.step(SUBSTEP);
+        }
+        assert!(b.all_finite());
+        let bb = b.bbox();
+        assert!(
+            bb.x1 <= screen().x1 + 1.0 && bb.x0 >= screen().x0 - 1.0,
+            "the blob was left outside at {bb:?}"
+        );
     }
 }

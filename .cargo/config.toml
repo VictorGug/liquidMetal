@@ -4,3 +4,15 @@
 # plain `cargo build` work without the caller having to export anything.
 [env]
 CMAKE_POLICY_VERSION_MINIMUM = "3.5"
+
+# Type-check the macOS half of the program from Linux.
+#
+# `--no-default-features` drops the bundled-SDL build, which is a C build targeting
+# macOS and cannot run here; without it the build script fails long before rustc
+# gets a chance to look at any Rust. Nothing is linked, so no macOS SDK is needed —
+# but every `cfg(target_os = "macos")` path is compiled, which is the whole point.
+#
+#     rustup target add aarch64-apple-darwin
+#     cargo check-mac
+[alias]
+check-mac = "check --target aarch64-apple-darwin --no-default-features"

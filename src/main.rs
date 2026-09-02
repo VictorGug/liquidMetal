@@ -9,20 +9,38 @@
 //! `std::env::set_var` call in `main` is wrapped in `unsafe`. Downgrading the whole
 //! crate to edition 2021 to avoid one `unsafe` block was not worth it.
 
+#[cfg(target_os = "linux")]
+#[path = "overlay_x11.rs"]
 mod overlay;
+#[cfg(target_os = "macos")]
+#[path = "overlay_mac.rs"]
+mod overlay;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!(
+    "liquidMetal has an overlay for Linux (X11/XWayland) and macOS (Cocoa). \
+     Porting it to another platform means writing the equivalent of src/overlay_x11.rs \
+     for it: a transparent, always-on-top, click-through-except-on-the-blob window. \
+     Everything else — physics, renderer, shader and the network protocol — is already \
+     portable."
+);
+
 mod physics;
 mod render;
 mod selftest;
+mod wire;
+mod net;
 
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use sdl2::event::{Event, WindowEvent};
 use sdl2::keyboard::Keycode;
 use sdl2::mouse::MouseButton;
 use sdl2::video::{GLProfile, SwapInterval};
 
-use physics::{Blob, Bounds, PointerTrack, v2};
+use net::{Net, NetConfig, NetEvent};
+use physics::{Ball, Blob, Bounds, PointerTrack, v2};
+use wire::Edge;
 
 // ---------------------------------------------------------------------------
 // TUNABLES for the shell around the simulation.
@@ -31,10 +49,30 @@ use physics::{Blob, Bounds, PointerTrack, v2};
 /// Frame budget while the blob is asleep: ~15 fps. It lives on someone's desktop all
 /// day and must not burn a core doing nothing. An incoming event cuts the wait short,
 /// so grabbing it still feels immediate.
-const IDLE_WAIT_MS: u32 = 66;
+const IDLE_WAIT_MS: u32 = overlay::IDLE_WAIT_MS;
 
 /// Window size used by `--windowed`, the renderer debug affordance.
 const WINDOWED_SIZE: (u32, u32) = (1280, 800);
+
+/// Idle frame budget while networking is on: ~40 fps of doing nothing.
+///
+/// The idle path blocks on the SDL event queue, which a blob arriving over a socket
+/// cannot wake. Rather than teach the network threads to push SDL events, the wait
+/// is simply shortened while `--net` is on, so an incoming throw appears within a
+/// frame or two. Each of those wake-ups drains an empty channel and goes back to
+/// sleep; it costs nothing measurable, and only happens when networking is enabled.
+const NET_IDLE_WAIT_MS: u32 = 25;
+
+/// How many blobs one screen will hold before it starts refusing throws.
+///
+/// Capped by the shader's ball budget, because blobs that touch are drawn as one
+/// merged field and the whole clump has to fit in one draw.
+const MAX_RESIDENT_BLOBS: usize = render::MAX_BLOBS / (physics::SAT_COUNT + 1);
+
+/// Belt and braces: a throw whose thread never reports back at all is bounced after
+/// this long. The socket paths all have their own, shorter deadlines, so this only
+/// fires if one of them is wedged.
+const FLIGHT_TIMEOUT: Duration = Duration::from_secs(3);
 
 // ---------------------------------------------------------------------------
 
@@ -47,11 +85,70 @@ enum Mode {
     /// write them to a file as RGBA. The lever that makes the renderer checkable
     /// without anyone being able to look at the screen.
     Capture(String),
+    /// A headless peer: join the network, catch whatever is thrown here, and throw
+    /// it straight back. No window, no GL, no X.
+    ///
+    /// This is the stand-in for a peer that is *not* this program — the thing at the
+    /// other end of a real throw is expected to be a different implementation on a
+    /// different operating system, and testing only this binary against itself would
+    /// never exercise the protocol as a contract. It also means the whole feature can
+    /// be tried out with one computer.
+    NetEcho,
+}
+
+/// Everything the network layer needs, collected from the command line.
+#[derive(Debug, Clone)]
+struct NetOpts {
+    /// Nothing binds a socket unless this is on.
+    enabled: bool,
+    /// Announce ourselves and listen for others.
+    discovery: bool,
+    group: String,
+    name: Option<String>,
+    capacity: usize,
+    /// Raw `--peer` specs, resolved once the network starts.
+    peers: Vec<String>,
+    /// `--net-echo` only: how long to hold a caught blob before throwing it back.
+    hold: Duration,
+    /// `--net-echo` only: invent a blob and throw it at the first peer that turns
+    /// up, so a game of catch can be started without anyone touching a mouse.
+    serve: bool,
+}
+
+impl Default for NetOpts {
+    fn default() -> NetOpts {
+        NetOpts {
+            enabled: false,
+            discovery: true,
+            group: "default".into(),
+            name: None,
+            capacity: MAX_RESIDENT_BLOBS,
+            peers: Vec::new(),
+            hold: Duration::from_millis(800),
+            serve: false,
+        }
+    }
 }
 
 fn main() -> ExitCode {
     let mut mode = Mode::Overlay;
+    let mut net = NetOpts::default();
     let mut args = std::env::args().skip(1);
+
+    /// `--flag VALUE`, with a clear error instead of a confusing one when the
+    /// value is missing.
+    macro_rules! value {
+        ($args:expr, $flag:expr) => {
+            match $args.next() {
+                Some(v) => v,
+                None => {
+                    eprintln!("liquidMetal: {} needs a value", $flag);
+                    return ExitCode::FAILURE;
+                }
+            }
+        };
+    }
+
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--windowed" => mode = Mode::Windowed,
@@ -63,6 +160,55 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
+
+            // --- networking ---
+            "--net" => net.enabled = true,
+            "--net-echo" => {
+                mode = Mode::NetEcho;
+                net.enabled = true;
+            }
+            // Naming a peer is asking for the network; not also having to pass
+            // --net removes a papercut with no ambiguity attached.
+            "--peer" => {
+                net.enabled = true;
+                net.peers.push(value!(args, "--peer"));
+            }
+            "--net-group" => net.group = value!(args, "--net-group"),
+            "--net-name" => net.name = Some(value!(args, "--net-name")),
+            "--no-discovery" => net.discovery = false,
+            "--net-capacity" => {
+                let v = value!(args, "--net-capacity");
+                match v.parse::<usize>() {
+                    Ok(n) if n >= 1 && n <= MAX_RESIDENT_BLOBS => net.capacity = n,
+                    Ok(n) => {
+                        eprintln!(
+                            "liquidMetal: --net-capacity {n} is out of range; \
+                             this build holds 1 to {MAX_RESIDENT_BLOBS} blobs \
+                             (raise render::MAX_BLOBS for more)"
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    Err(_) => {
+                        eprintln!("liquidMetal: --net-capacity wants a number, got {v:?}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--net-serve" => {
+                mode = Mode::NetEcho;
+                net.enabled = true;
+                net.serve = true;
+            }
+            "--net-hold" => {
+                let v = value!(args, "--net-hold");
+                match v.parse::<u64>() {
+                    Ok(ms) => net.hold = Duration::from_millis(ms),
+                    Err(_) => {
+                        eprintln!("liquidMetal: --net-hold wants milliseconds, got {v:?}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             "-h" | "--help" => {
                 print_usage();
                 return ExitCode::SUCCESS;
@@ -79,7 +225,17 @@ fn main() -> ExitCode {
         return if selftest::run() { ExitCode::SUCCESS } else { ExitCode::FAILURE };
     }
 
-    match run(&mode) {
+    if mode == Mode::NetEcho {
+        return match run_echo(&net) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("\nliquidMetal --net-echo could not start.\n{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    match run(&mode, &net) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("\nliquidMetal could not start.\n{e}");
@@ -89,30 +245,57 @@ fn main() -> ExitCode {
 }
 
 fn print_usage() {
-    println!(
-        "liquidMetal — a draggable liquid-metal blob for your desktop\n\
-         \n\
-         USAGE: liquid-metal [OPTIONS]\n\
-         \n\
-         OPTIONS:\n    \
-           --windowed   Open an ordinary opaque window instead of the desktop overlay.\n    \
-                        For debugging the renderer without fighting the compositor.\n    \
-           --selftest   Step the physics headlessly through a scripted grab / fling /\n    \
-                        bounce sequence, print PASS/FAIL per assertion, and exit.\n    \
-           --capture P  Render a few frames, read the blob back out of the framebuffer\n    \
-                        and write it to P as a NetPBM PAM file (RGBA), then exit.\n    \
-           -h, --help   Show this.\n\
-         \n\
-         CONTROLS:\n    \
-           Left-drag       move the blob; release to fling it\n    \
-           Double-click    reset to the centre of the screen\n    \
-           Middle-click    quit (on the blob; everywhere else the click passes through)\n    \
-           Esc             quit, when the window has keyboard focus\n    \
-           Ctrl+C          quit, from the terminal"
+    // A raw string rather than an escaped one: the previous form ended every line
+    // with `\n    \`, and a trailing backslash in a Rust string literal eats the
+    // next line's indentation, so every wrapped description silently un-indented
+    // itself back to column four. What you see here is what gets printed.
+    print!(
+        r#"liquidMetal — a draggable liquid-metal blob for your desktop
+
+USAGE: liquid-metal [OPTIONS]
+
+OPTIONS:
+  --windowed          Open an ordinary opaque window instead of the desktop
+                      overlay. For debugging the renderer without fighting the
+                      compositor.
+  --selftest          Step the physics headlessly through a scripted grab /
+                      fling / bounce sequence, print PASS/FAIL per assertion,
+                      and exit.
+  --capture P         Render a few frames, read the blob back out of the
+                      framebuffer and write it to P as a NetPBM PAM file
+                      (RGBA), then exit.
+  -h, --help          Show this.
+
+NETWORK — throwing the blob to another machine:
+  --net               Find other machines on the network and turn the screen
+                      edges that lead to one into doors. Off by default: it
+                      opens a socket, and nothing about it is authenticated.
+  --peer [E=]HOST:P   Name a peer explicitly, optionally pinned to the edge E
+                      (left / right / top / bottom). Implies --net. Repeatable.
+  --net-group NAME    Only talk to peers announcing this group. A name, not a
+                      password. Default: default
+  --net-name NAME     How this machine introduces itself. Default: hostname
+  --no-discovery      Do not broadcast or listen for beacons; --peer only.
+  --net-capacity N    Blobs this screen will hold before refusing throws (1-4).
+  --net-echo          Run headless as a peer that catches a blob and throws it
+                      straight back. The stand-in for a machine you do not
+                      have, and the way to try this out with one computer.
+  --net-serve         Like --net-echo, but invents a blob and throws it at the
+                      first peer it finds. Start one of these next to a --net
+                      instance and the blob arrives on its own.
+  --net-hold MS       How long --net-echo holds a blob. Default: 800
+
+CONTROLS:
+  Left-drag           move the blob; release to fling it
+  Double-click        reset to the centre of the screen
+  Middle-click        quit (on the blob; elsewhere the click passes through)
+  Esc                 quit, when the window has keyboard focus
+  Ctrl+C              quit, from the terminal
+"#
     );
 }
 
-fn run(mode: &Mode) -> Result<(), String> {
+fn run(mode: &Mode, netopts: &NetOpts) -> Result<(), String> {
     let overlay_mode = *mode == Mode::Overlay;
     let capture_path = match mode {
         Mode::Capture(p) => Some(p.clone()),
@@ -122,34 +305,17 @@ fn run(mode: &Mode) -> Result<(), String> {
     // The X connection comes first: in overlay mode it decides how big the window
     // has to be, so it must succeed before SDL creates anything.
     let mut x11 = if overlay_mode {
-        Some(overlay::X11::connect()?)
+        Some(overlay::Overlay::connect()?)
     } else {
         // --windowed deliberately touches no X11 at all. The whole point of that
         // mode is to debug the renderer with the compositor out of the picture.
         None
     };
 
-    // SDL has no Wayland layer-shell support, so an always-on-top click-through
-    // overlay is not reachable from a Wayland-native surface. Force the X11 backend
-    // (XWayland) before SDL_Init looks at the environment.
-    //
-    // SAFETY: single-threaded, and this runs before any SDL or std call that could
-    // concurrently read the environment.
-    unsafe {
-        std::env::set_var("SDL_VIDEODRIVER", "x11");
-        // And drop WAYLAND_DISPLAY for our own process only. Forcing SDL's video
-        // driver is not enough: EGL picks its *platform* by sniffing the
-        // environment, so with WAYLAND_DISPLAY still set it selects the Wayland
-        // platform, hands the display off to libnvidia-egl-wayland, and that
-        // segfaults inside wl_proxy_create_wrapper because we never made a Wayland
-        // connection. Removing it makes EGL choose the X11 platform, matching the
-        // X11 window we are actually creating.
-        std::env::remove_var("WAYLAND_DISPLAY");
-        // Belt and braces for the same problem: SDL 2.26's X11 loader passes
-        // platform 0 to eglGetPlatformDisplay, and the vendor loader then guesses.
-        // We do not ask for EGL, but if anything ever does, this keeps it on X11.
-        std::env::set_var("EGL_PLATFORM", "x11");
-    }
+    // Whatever has to be true of the process before SDL initialises. On X11 that is
+    // a pair of environment variables with a long story behind them; on macOS there
+    // is nothing to do.
+    overlay::prepare_process_environment();
 
     // Deliver clicks even when the overlay does not hold keyboard focus, and do not
     // grab focus when the window is first shown.
@@ -162,19 +328,25 @@ fn run(mode: &Mode) -> Result<(), String> {
         .map_err(|e| format!("the SDL video subsystem could not start: {e}"))?;
 
     let driver = video.current_video_driver();
-    if driver != "x11" {
-        return Err(format!(
-            "SDL chose the {driver:?} video driver, but liquidMetal needs {:?}.\n\
-             The overlay relies on X11 features (ARGB visuals, EWMH, XShape) that have \
-             no SDL-reachable equivalent on Wayland.\n\
-             Check that an X server or XWayland is running on $DISPLAY.",
-            "x11"
-        ));
+    if overlay_mode {
+        overlay::check_video_driver(driver)?;
     }
 
+    // macOS cannot answer this until SDL's video subsystem is up, so the desktop is
+    // probed here rather than at connect time.
+    if let Some(x) = x11.as_mut() {
+        x.probe_desktop(&video)?;
+    }
     let (win_w, win_h) = match &x11 {
-        Some(x) => (x.virtual_w as u32, x.virtual_h as u32),
+        Some(x) => x.desktop_size(),
         None => WINDOWED_SIZE,
+    };
+    // Where the overlay window goes. Always (0, 0) on X11, where the root window is
+    // the origin; on macOS a display left of or above the primary one puts the
+    // desktop's corner at negative coordinates.
+    let win_origin = match &x11 {
+        Some(x) => x.desktop_origin(),
+        None => (0, 0),
     };
 
     // Getting a *transparent* window is the one genuinely driver-dependent step
@@ -185,7 +357,7 @@ fn run(mode: &Mode) -> Result<(), String> {
     // `overlay::find_argb_visual` for why the alpha bits read back as 8 on a window
     // that has no alpha channel at all.
     let argb_visual = x11.as_ref().and_then(|x| x.argb_visual);
-    let attempts: Vec<GlAttempt> = if overlay_mode {
+    let attempts: Vec<GlAttempt> = if overlay_mode && overlay::NEEDS_VISUAL_STRATEGY {
         vec![
             GlAttempt {
                 visual: argb_visual,
@@ -222,7 +394,8 @@ fn run(mode: &Mode) -> Result<(), String> {
             &a.visual.map(|v| v.to_string()).unwrap_or_default(),
         );
 
-        let (window, ctx) = match build_window_and_context(&video, win_w, win_h, overlay_mode, a.ctx)
+        let (window, ctx) = match
+            build_window_and_context(&video, win_origin, win_w, win_h, overlay_mode, a.ctx)
         {
             Ok(pair) => pair,
             Err(e) => {
@@ -234,7 +407,7 @@ fn run(mode: &Mode) -> Result<(), String> {
 
         // The honest check: ask X what depth the window really got. Depth 32 is the
         // only thing that gives the overlay an alpha channel.
-        let depth = match (x11.as_ref(), x_window_id(&window)) {
+        let depth = match (x11.as_ref(), overlay::native_window_handle(&window)) {
             (Some(x), Ok(id)) => x.depth_of(id).unwrap_or(0),
             _ => 0,
         };
@@ -267,6 +440,16 @@ fn run(mode: &Mode) -> Result<(), String> {
         .gl_make_current(&gl_ctx)
         .map_err(|e| format!("the OpenGL context could not be made current: {e}"))?;
 
+    // Anything the overlay can only do once there is a live, current GL context.
+    // Nothing on X11; on macOS this is where the GL surface is made non-opaque,
+    // which is the step that decides whether the overlay is transparent or a black
+    // rectangle the size of the desktop.
+    if let Some(x) = x11.as_mut() {
+        if let Err(e) = x.on_gl_context_ready() {
+            eprintln!("[gl] the overlay surface could not be made transparent: {e}");
+        }
+    }
+
     let got_alpha = video.gl_attr().alpha_size();
     let got_rgb = (
         video.gl_attr().red_size(),
@@ -296,7 +479,7 @@ fn run(mode: &Mode) -> Result<(), String> {
     // --- overlay setup: properties, then an empty input region, then map ---
     let mut xid = 0u64;
     if let Some(x) = x11.as_mut() {
-        xid = x_window_id(&window)?;
+        xid = overlay::native_window_handle(&window)?;
         x.set_window(xid)?;
         x.apply_overlay_properties()?;
         // Fully click-through from the very first frame it is visible.
@@ -326,7 +509,7 @@ fn run(mode: &Mode) -> Result<(), String> {
     let (mut logical_w, mut logical_h) = window.size();
     let mut origin = (0i32, 0i32);
     let screen = match x11.as_ref() {
-        Some(x) => (x.virtual_w as u32, x.virtual_h as u32),
+        Some(x) => x.desktop_size(),
         None => (logical_w, logical_h),
     };
     if let Some(x) = x11.as_ref() {
@@ -347,11 +530,12 @@ fn run(mode: &Mode) -> Result<(), String> {
         }
     }
     let bounds = visible_bounds(origin, (logical_w, logical_h), screen);
+    net::publish_screen_size((bounds.x1 - bounds.x0) as u32, (bounds.y1 - bounds.y0) as u32);
     let mut blob = Blob::new(bounds);
     blob.reset();
     let mut app = App {
         cursor: blob.core.p,
-        blob,
+        blobs: vec![Slot { blob, flight: None }],
         track: PointerTrack::new(),
         running: true,
         quit_reason: "unknown",
@@ -361,7 +545,45 @@ fn run(mode: &Mode) -> Result<(), String> {
         screen,
         geometry_dirty: false,
         touched: false,
-        check_hit: !overlay_mode,
+        // On X11 the input region already decided the pointer is on the blob before
+        // the event was delivered, so a second test could only disagree with it.
+        // macOS has no input region — the window is toggled between clickable and
+        // not, one frame behind the cursor — so the local test is what catches a
+        // click that arrived in the gap.
+        check_hit: !overlay_mode || !overlay::REGION_IS_THE_HIT_TEST,
+        capacity: netopts.capacity,
+        portals: 0,
+    };
+
+    // --- the network, if it was asked for ---
+    //
+    // A failure here is reported and then ignored: the blob toy works perfectly
+    // well without it, and refusing to start the whole program because a socket
+    // would not bind would be a poor trade.
+    let mut net = if netopts.enabled && capture_path.is_none() {
+        match start_net(netopts) {
+            Ok(n) => {
+                println!(
+                    "  network           : on as {:?} in group {:?}, listening on {} \
+                     (holding up to {} blob(s))",
+                    netopts.name.clone().unwrap_or_else(net::hostname),
+                    netopts.group,
+                    n.local_addr,
+                    netopts.capacity,
+                );
+                println!(
+                    "                      screen edges that lead to a peer become doors; \
+                     throw the blob off one."
+                );
+                Some(n)
+            }
+            Err(e) => {
+                eprintln!("[net] networking is off: {e}");
+                None
+            }
+        }
+    } else {
+        None
     };
     let mouse = sdl.mouse();
     let mut event_pump = sdl
@@ -387,9 +609,10 @@ fn run(mode: &Mode) -> Result<(), String> {
     while app.running {
         // While asleep, block on the event queue instead of spinning. An event cuts
         // the wait short, so the blob is still immediately grabbable.
-        if app.blob.is_at_rest() {
+        if app.at_rest() {
             idle_frames += 1;
-            if let Some(ev) = event_pump.wait_event_timeout(IDLE_WAIT_MS) {
+            let wait = if net.is_some() { NET_IDLE_WAIT_MS } else { IDLE_WAIT_MS };
+            if let Some(ev) = event_pump.wait_event_timeout(wait) {
                 app.handle(ev, &mouse, &start);
             }
         }
@@ -402,7 +625,7 @@ fn run(mode: &Mode) -> Result<(), String> {
 
         // Keep feeding the throw estimator even when the pointer is not moving, so
         // holding still for a moment before letting go really does drop the blob.
-        if app.blob.is_grabbed() {
+        if app.grabbed().is_some() {
             app.track.push(start.elapsed().as_secs_f64(), app.cursor);
         }
 
@@ -411,9 +634,32 @@ fn run(mode: &Mode) -> Result<(), String> {
         let frame_dt = (now - last).as_secs_f32().min(physics::MAX_FRAME_TIME);
         last = now;
         acc += frame_dt;
+        // Which edges lead somewhere. Re-asked every frame, because a peer
+        // appearing or going away turns a wall into a door and back.
+        let portals = net.as_ref().map(|n| n.portal_edges()).unwrap_or(0);
+        app.set_portals(portals);
+
         while acc >= physics::SUBSTEP {
-            app.blob.step(physics::SUBSTEP);
+            for slot in app.blobs.iter_mut() {
+                // A blob that has left and is waiting for its receipt is frozen
+                // once it is fully out of sight, so a throw that is slow to be
+                // answered does not coast away to infinity and come back from
+                // somewhere absurd if it is refused.
+                if slot.flight.is_some() && slot.blob.is_off_screen() {
+                    continue;
+                }
+                slot.blob.step(physics::SUBSTEP);
+            }
             acc -= physics::SUBSTEP;
+        }
+
+        // --- the network: things leaving, things arriving ---
+        if let Some(n) = net.as_mut() {
+            n.set_resident(app.resident());
+            handle_departures(&mut app, n);
+            let events = n.poll();
+            handle_net_events(&mut app, n, events);
+            reap_stalled_flights(&mut app);
         }
 
         // --- keep the blob's world in step with where the window really is ---
@@ -440,8 +686,12 @@ fn run(mode: &Mode) -> Result<(), String> {
                         // it needs a quarter second of stillness that has not elapsed
                         // this early in startup.)
                         if !app.touched {
-                            app.blob.reset();
-                            app.cursor = app.blob.core.p;
+                            for slot in app.blobs.iter_mut() {
+                                slot.blob.reset();
+                            }
+                            if let Some(first) = app.blobs.first() {
+                                app.cursor = first.blob.core.p;
+                            }
                         }
                         // Re-log the input region: the one reported before the move
                         // describes a window that is no longer where it was.
@@ -469,7 +719,15 @@ fn run(mode: &Mode) -> Result<(), String> {
 
         // --- input region: the region *is* the hit test, so it is the only one ---
         if let Some(x) = x11.as_mut() {
-            let rects = app.blob.hit_rects();
+            // The union across every blob. XShape takes the rectangles as a set,
+            // so concatenating each blob's own cover is already the right answer.
+            let mut rects: Vec<(i32, i32, i32, i32)> = Vec::new();
+            for slot in &app.blobs {
+                if slot.flight.is_some() && slot.blob.is_off_screen() {
+                    continue;
+                }
+                rects.extend(slot.blob.hit_rects());
+            }
             match x.set_input_rects(&rects) {
                 Err(e) => {
                     eprintln!("[x11] could not update the input region: {e}");
@@ -517,31 +775,52 @@ fn run(mode: &Mode) -> Result<(), String> {
         // Physics and pointer coordinates are logical pixels; the framebuffer may be
         // larger under a HiDPI scale, so scale the metaballs on the way to the shader.
         let dpr = if app.logical_w > 0 { draw_w as f32 / app.logical_w as f32 } else { 1.0 };
-        let mut balls = app.blob.balls();
-        if (dpr - 1.0).abs() > 1e-3 {
-            for b in balls.iter_mut() {
-                b.p = b.p * dpr;
-                b.r *= dpr;
+
+        // Blobs whose bounding boxes touch are shaded in one pass, so they join into
+        // a single metaball field and merge like the liquid they are supposed to be.
+        // Blobs far apart get their own pass, scissored to their own corner, and
+        // cost exactly what one blob has always cost.
+        let mut groups: Vec<(Bounds, Vec<Ball>)> = Vec::new();
+        for slot in &app.blobs {
+            if slot.flight.is_some() && slot.blob.is_off_screen() {
+                continue;
             }
+            let mut balls: Vec<Ball> = slot.blob.balls().to_vec();
+            let bb = slot.blob.bbox();
+            if (dpr - 1.0).abs() > 1e-3 {
+                for b in balls.iter_mut() {
+                    b.p = b.p * dpr;
+                    b.r *= dpr;
+                }
+            }
+            groups.push((bb, balls));
         }
-        let bb = app.blob.bbox();
-        let scissor = (
-            (bb.x0 * dpr).floor() as i32 - 2,
-            (bb.y0 * dpr).floor() as i32 - 2,
-            ((bb.x1 - bb.x0) * dpr).ceil() as i32 + 4,
-            ((bb.y1 - bb.y0) * dpr).ceil() as i32 + 4,
-        );
+        merge_touching(&mut groups);
+
         // --capture uses an ordinary window for convenience, but must render the
         // transparent path, otherwise the alpha it reads back is meaningless.
         let opaque = !overlay_mode && capture_path.is_none();
-        renderer.draw(
-            draw_w as i32,
-            draw_h as i32,
-            start.elapsed().as_secs_f32(),
-            &balls,
-            Some(scissor),
-            opaque,
-        );
+        let time = start.elapsed().as_secs_f32();
+        renderer.begin_frame(draw_w as i32, draw_h as i32);
+        if opaque {
+            // The opaque debug path draws its checkerboard everywhere, so it is one
+            // unscissored pass over every ball on screen.
+            let all: Vec<Ball> = groups.iter().flat_map(|(_, b)| b.iter().copied()).collect();
+            renderer.draw_group(draw_w as i32, draw_h as i32, time, &all, None, true);
+        } else {
+            for (bb, balls) in &groups {
+                renderer.draw_group(
+                    draw_w as i32,
+                    draw_h as i32,
+                    time,
+                    balls,
+                    Some(scissor_of(*bb, dpr)),
+                    false,
+                );
+            }
+        }
+        // --capture reads back one rectangle, so it wants the union of everything.
+        let scissor = scissor_of(union_all(&groups), dpr);
         // --capture: let the shader settle for a few frames, then read the blob's
         // own bounding box straight out of the framebuffer, alpha included.
         if let Some(path) = &capture_path {
@@ -589,10 +868,31 @@ fn run(mode: &Mode) -> Result<(), String> {
     Ok(())
 }
 
+/// One blob on this screen, plus whatever the network is currently doing with it.
+struct Slot {
+    blob: Blob,
+    /// Set once the blob has gone through a door and we are waiting for the peer's
+    /// receipt. Until that arrives the blob is still ours: still simulated, still
+    /// drawn sliding off the edge, and still recoverable.
+    flight: Option<Flight>,
+}
+
+/// A throw in progress.
+struct Flight {
+    throw_id: u64,
+    /// The edge it left by, so a refusal can be turned back into a bounce off that
+    /// same edge.
+    edge: Edge,
+    peer: String,
+    sent: Instant,
+}
+
 /// Everything the event handler mutates, so it can be one method instead of a
 /// nine-argument function.
 struct App {
-    blob: Blob,
+    /// Blobs on this screen. Ordinarily one; more once machines start throwing
+    /// them at each other. Newest last, which is also grab priority.
+    blobs: Vec<Slot>,
     track: PointerTrack,
     cursor: physics::Vec2,
     running: bool,
@@ -619,17 +919,86 @@ struct App {
     /// mode has no input region, so it needs one, and it uses the exact same
     /// rectangle cover to guarantee the two modes behave identically.
     check_hit: bool,
+    /// How many blobs this screen will hold.
+    capacity: usize,
+    /// Edges that currently lead to a peer, so an arriving blob is given the same
+    /// doors as everyone else.
+    portals: u8,
 }
 
 impl App {
-    fn on_blob(&self) -> bool {
-        !self.check_hit || self.blob.hit_test(self.cursor)
+    /// Which blob is under `at`, if any.
+    ///
+    /// `hit_test` uses the very same rectangle cover the X input region is built
+    /// from, so in overlay mode this agrees with the decision X already made about
+    /// whether the click reaches us at all — it is only being asked *which* blob.
+    fn blob_at(&self, at: physics::Vec2) -> Option<usize> {
+        // Last first: the most recently arrived blob is on top of an older one it
+        // has landed on.
+        if let Some(i) =
+            self.blobs.iter().rposition(|s| s.flight.is_none() && s.blob.hit_test(at))
+        {
+            return Some(i);
+        }
+        // In overlay mode X has already decided the pointer is on a blob, so a miss
+        // here means the input region is a frame stale and the blob has moved since
+        // it was uploaded. Give the click to whichever blob the pointer is deepest
+        // inside rather than dropping it — a dropped grab on a fast blob is much
+        // more annoying than a slightly generous one.
+        if !self.check_hit {
+            return self
+                .blobs
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.flight.is_none())
+                .max_by(|a, b| a.1.blob.field(at).total_cmp(&b.1.blob.field(at)))
+                .map(|(i, _)| i);
+        }
+        None
     }
 
-    /// Re-derive the blob's world after the window has moved or been resized.
+    fn grabbed(&self) -> Option<usize> {
+        self.blobs.iter().position(|s| s.blob.is_grabbed())
+    }
+
+    /// Blobs actually on this screen, which is what the peer is told and what the
+    /// capacity check uses. A blob in flight has already left.
+    fn resident(&self) -> usize {
+        self.blobs.iter().filter(|s| s.flight.is_none()).count()
+    }
+
+    /// True when nothing is moving and nothing is in the post, so the frame rate
+    /// can be throttled.
+    fn at_rest(&self) -> bool {
+        self.blobs.iter().all(|s| s.flight.is_none() && s.blob.is_at_rest())
+    }
+
+    /// Re-derive every blob's world after the window has moved or been resized.
     fn rebound(&mut self) {
         let b = visible_bounds(self.origin, (self.logical_w, self.logical_h), self.screen);
-        self.blob.set_bounds(b);
+        for s in self.blobs.iter_mut() {
+            s.blob.set_bounds(b);
+        }
+        net::publish_screen_size((b.x1 - b.x0) as u32, (b.y1 - b.y0) as u32);
+    }
+
+    /// The blob's world, recomputed from where the window actually is.
+    fn bounds(&self) -> Bounds {
+        visible_bounds(self.origin, (self.logical_w, self.logical_h), self.screen)
+    }
+
+    /// Open or close the doors. Called every frame: a peer appearing or vanishing
+    /// changes an edge from a wall to a door and back.
+    fn set_portals(&mut self, mask: u8) {
+        self.portals = mask;
+        for s in self.blobs.iter_mut() {
+            // A blob already on its way out keeps its door open even if the peer
+            // has just gone; closing it under a departing blob would strand it
+            // outside the screen with no wall to come back to.
+            if s.flight.is_none() {
+                s.blob.set_portals(mask);
+            }
+        }
     }
 
     fn stop(&mut self, why: &'static str) {
@@ -647,25 +1016,23 @@ impl App {
 
             Event::MouseButtonDown { mouse_btn: MouseButton::Middle, x, y, .. } => {
                 self.cursor = v2(x as f32, y as f32);
-                if self.on_blob() {
+                if self.blob_at(self.cursor).is_some() {
                     self.stop("middle-click on the blob");
                 }
             }
 
             Event::MouseButtonDown { mouse_btn: MouseButton::Left, x, y, clicks, .. } => {
                 self.cursor = v2(x as f32, y as f32);
-                if !self.on_blob() {
-                    return;
-                }
+                let Some(i) = self.blob_at(self.cursor) else { return };
                 self.touched = true;
                 if clicks >= 2 {
-                    self.blob.reset();
+                    self.blobs[i].blob.reset();
                     mouse.capture(false);
                     self.track.clear();
                 } else {
                     self.track.clear();
                     self.track.push(t, self.cursor);
-                    self.blob.grab(self.cursor);
+                    self.blobs[i].blob.grab(self.cursor);
                     // Without capture, a fast drag outruns the input region: the
                     // pointer leaves it, motion events stop, and the blob is
                     // dropped mid-fling.
@@ -674,11 +1041,11 @@ impl App {
             }
 
             Event::MouseButtonUp { mouse_btn: MouseButton::Left, x, y, .. } => {
-                if self.blob.is_grabbed() {
+                if let Some(i) = self.grabbed() {
                     self.cursor = v2(x as f32, y as f32);
                     self.track.push(t, self.cursor);
                     let throw = self.track.velocity(t);
-                    self.blob.release(throw);
+                    self.blobs[i].blob.release(throw);
                 }
                 mouse.capture(false);
                 self.track.clear();
@@ -686,9 +1053,9 @@ impl App {
 
             Event::MouseMotion { x, y, .. } => {
                 self.cursor = v2(x as f32, y as f32);
-                if self.blob.is_grabbed() {
+                if let Some(i) = self.grabbed() {
                     self.track.push(t, self.cursor);
-                    self.blob.drag_to(self.cursor);
+                    self.blobs[i].blob.drag_to(self.cursor);
                 }
             }
 
@@ -752,6 +1119,328 @@ fn visible_bounds(origin: (i32, i32), win: (u32, u32), screen: (u32, u32)) -> Bo
 ///
 /// PAM because it is the only trivially-hand-writable format that carries a real
 /// alpha channel, and ImageMagick / PIL both read it. No image crate needed.
+// ---------------------------------------------------------------------------
+// Drawing several blobs
+// ---------------------------------------------------------------------------
+
+/// The scissor rectangle for a bounding box, in framebuffer pixels, with a couple
+/// of pixels of slack for the antialiased rim.
+fn scissor_of(bb: Bounds, dpr: f32) -> (i32, i32, i32, i32) {
+    (
+        (bb.x0 * dpr).floor() as i32 - 2,
+        (bb.y0 * dpr).floor() as i32 - 2,
+        ((bb.x1 - bb.x0) * dpr).ceil() as i32 + 4,
+        ((bb.y1 - bb.y0) * dpr).ceil() as i32 + 4,
+    )
+}
+
+fn union_all(groups: &[(Bounds, Vec<Ball>)]) -> Bounds {
+    let mut it = groups.iter().map(|(b, _)| *b);
+    match it.next() {
+        Some(first) => it.fold(first, union_of),
+        None => Bounds { x0: 0.0, y0: 0.0, x1: 0.0, y1: 0.0 },
+    }
+}
+
+fn union_of(a: Bounds, b: Bounds) -> Bounds {
+    Bounds {
+        x0: a.x0.min(b.x0),
+        y0: a.y0.min(b.y0),
+        x1: a.x1.max(b.x1),
+        y1: a.y1.max(b.y1),
+    }
+}
+
+fn touches(a: Bounds, b: Bounds) -> bool {
+    a.x0 <= b.x1 && b.x0 <= a.x1 && a.y0 <= b.y1 && b.y0 <= a.y1
+}
+
+/// Fold groups whose bounding boxes touch into one, repeatedly, until none do.
+///
+/// Balls shaded in the same pass share one metaball field, so this is what decides
+/// whether two blobs that meet flow together or merely overlap. Quadratic and
+/// restarted on every merge, which is fine for the handful of blobs a screen holds
+/// and much easier to be sure of than a union-find.
+fn merge_touching(groups: &mut Vec<(Bounds, Vec<Ball>)>) {
+    let mut again = true;
+    while again {
+        again = false;
+        'outer: for i in 0..groups.len() {
+            for j in (i + 1)..groups.len() {
+                if touches(groups[i].0, groups[j].0)
+                    && groups[i].1.len() + groups[j].1.len() <= render::MAX_BLOBS
+                {
+                    let (bb, balls) = groups.remove(j);
+                    groups[i].0 = union_of(groups[i].0, bb);
+                    groups[i].1.extend(balls);
+                    again = true;
+                    break 'outer;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Throwing and catching
+// ---------------------------------------------------------------------------
+
+fn start_net(opts: &NetOpts) -> Result<Net, String> {
+    let mut pinned = Vec::new();
+    for spec in &opts.peers {
+        let (edge, addr) =
+            net::parse_peer(spec).map_err(|e| format!("--peer {spec:?} is not usable: {e}"))?;
+        pinned.push((edge, addr));
+    }
+    Net::start(NetConfig {
+        group: opts.group.clone(),
+        name: opts.name.clone().unwrap_or_else(net::hostname),
+        capacity: opts.capacity as u16,
+        discovery: opts.discovery,
+        pinned,
+    })
+}
+
+/// Any blob that has gone through a door this frame becomes a throw.
+///
+/// The velocity handed to the wire is divided by *this* screen's height, and the
+/// receiver multiplies by its own — see `wire.rs` for why the gesture rather than
+/// the pixels is what travels.
+fn handle_departures(app: &mut App, net: &mut Net) {
+    for slot in app.blobs.iter_mut() {
+        if slot.flight.is_some() {
+            continue;
+        }
+        let Some(edge) = slot.blob.departing_edge() else { continue };
+        let b = slot.blob.bounds;
+        let h = (b.y1 - b.y0).max(1.0);
+        let along = slot.blob.along_edge(edge);
+        let v = slot.blob.core.v;
+        match net.throw(edge, along, (v.x / h, v.y / h), slot.blob.sat_states()) {
+            Some((throw_id, peer)) => {
+                let label = peer.label();
+                println!(
+                    "[net] the blob went out the {} edge at {:.0}%, {:.0} px/s -> {label}",
+                    edge.name(),
+                    along * 100.0,
+                    v.len()
+                );
+                slot.flight =
+                    Some(Flight { throw_id, edge, peer: label, sent: Instant::now() });
+            }
+            None => {
+                // The peer went away between the door opening and the blob getting
+                // to it. That edge is a wall again.
+                slot.blob.bounce_back(edge);
+            }
+        }
+    }
+}
+
+/// Turn a throw that did not connect back into a bounce.
+fn bounce_flight(app: &mut App, throw_id: u64, why: &str) {
+    if let Some(slot) = app
+        .blobs
+        .iter_mut()
+        .find(|s| s.flight.as_ref().is_some_and(|f| f.throw_id == throw_id))
+    {
+        let flight = slot.flight.take().expect("just matched on it");
+        println!("[net] the throw to {} did not connect ({why}); it bounced", flight.peer);
+        slot.blob.bounce_back(flight.edge);
+    }
+}
+
+fn handle_net_events(app: &mut App, net: &mut Net, events: Vec<NetEvent>) {
+    for ev in events {
+        match ev {
+            NetEvent::Arrived { throw, from } => {
+                // The network layer reserved a slot before acknowledging, so there
+                // is room; this check is the belt to that braces.
+                if app.blobs.len() >= app.capacity.max(1) + 1 {
+                    net.commit_arrival();
+                    eprintln!("[net] dropped a blob from {from}: no room after all");
+                    continue;
+                }
+                let bounds = app.bounds();
+                let h = (bounds.y1 - bounds.y0).max(1.0);
+                let entry = throw.edge.opposite();
+                let vel = v2(throw.vel_x * h, throw.vel_y * h);
+                let mut blob = Blob::arriving(bounds, entry, throw.along, vel, &throw.sats);
+                blob.set_portals(app.portals);
+                println!(
+                    "[net] caught a blob from {from}: in at the {} edge, {:.0}% along, \
+                     {:.0} px/s, {} satellites of shape",
+                    entry.name(),
+                    throw.along * 100.0,
+                    vel.len(),
+                    throw.sats.len()
+                );
+                app.blobs.push(Slot { blob, flight: None });
+                app.touched = true;
+                net.commit_arrival();
+            }
+            NetEvent::Landed { throw_id, peer } => {
+                let before = app.blobs.len();
+                app.blobs
+                    .retain(|s| s.flight.as_ref().map(|f| f.throw_id) != Some(throw_id));
+                if app.blobs.len() < before {
+                    println!("[net] {peer} has it.");
+                }
+            }
+            NetEvent::Refused { throw_id, peer: _, why } => {
+                bounce_flight(app, throw_id, why.explain());
+            }
+            NetEvent::Lost { throw_id, peer: _, why } => bounce_flight(app, throw_id, &why),
+            NetEvent::PeerUp { name, addr, screen } => {
+                println!(
+                    "[net] {name} is here at {addr} ({}x{}). The edges that lead to it \
+                     are doors now.",
+                    screen.0, screen.1
+                );
+            }
+            NetEvent::PeerDown { name } => {
+                println!("[net] {name} has gone.");
+            }
+            NetEvent::Note(m) => eprintln!("[net] {m}"),
+        }
+    }
+}
+
+/// A throw whose thread never reported back at all. Every socket path has its own
+/// shorter deadline, so this should never fire — but a blob stuck off-screen with
+/// no way home would be the worst possible bug to leave available.
+fn reap_stalled_flights(app: &mut App) {
+    let stalled: Vec<u64> = app
+        .blobs
+        .iter()
+        .filter_map(|s| s.flight.as_ref())
+        .filter(|f| f.sent.elapsed() > FLIGHT_TIMEOUT)
+        .map(|f| f.throw_id)
+        .collect();
+    for id in stalled {
+        bounce_flight(app, id, "no answer at all");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --net-echo
+// ---------------------------------------------------------------------------
+
+/// A peer with no screen: catch a blob, hold it, throw it back.
+///
+/// The point of this mode is that the thing at the other end of a real throw will
+/// not be this program. Running the graphical app against *itself* would happily
+/// pass a broken assumption back and forth and never notice. This end has no
+/// physics, no renderer and no window — only the protocol — so anything it can
+/// catch and return is genuinely defined by `wire.rs` and not by shared code.
+fn run_echo(opts: &NetOpts) -> Result<(), String> {
+    /// A plausible screen, so `along` and the velocity units are exercised for
+    /// real rather than degenerating to 1.
+    const ECHO_SCREEN: (u32, u32) = (1920, 1080);
+
+    net::publish_screen_size(ECHO_SCREEN.0, ECHO_SCREEN.1);
+    let mut net = start_net(opts)?;
+    println!(
+        "liquidMetal --net-echo: a headless peer in group {:?}, listening on {}.\n\
+         Pretending to be a {}x{} screen. Catching blobs and throwing them straight \
+         back after {} ms.\n\
+         Ctrl+C to stop.\n",
+        opts.group,
+        net.local_addr,
+        ECHO_SCREEN.0,
+        ECHO_SCREEN.1,
+        opts.hold.as_millis()
+    );
+
+    let mut held: Vec<(Instant, wire::Throw)> = Vec::new();
+    let mut caught = 0u64;
+    let mut returned = 0u64;
+    let mut served = !opts.serve;
+
+    loop {
+        net.set_resident(held.len());
+
+        // Put a blob into play. Nothing here has a screen or a simulation, so the
+        // served blob is invented outright — a throw off the right-hand edge, half
+        // way up, at a bit over one screen-height per second, carrying a plausibly
+        // deformed set of satellites.
+        if !served {
+            let sats: Vec<wire::SatState> = (0..8)
+                .map(|i| {
+                    let a = std::f32::consts::TAU * (i as f32) / 8.0;
+                    wire::SatState {
+                        off_x: a.cos() * 1.3,
+                        off_y: a.sin() * 0.8,
+                        vel_x: -0.4,
+                        vel_y: 0.1,
+                    }
+                })
+                .collect();
+            if net.throw(Edge::Right, 0.5, (1.2, -0.15), sats).is_some() {
+                served = true;
+                println!("[echo] served a blob off the right edge");
+            }
+        }
+        for ev in net.poll() {
+            match ev {
+                NetEvent::Arrived { throw, from } => {
+                    caught += 1;
+                    println!(
+                        "[echo] caught #{caught} from {from}: out of their {} edge at \
+                         {:.0}%, {:.2} screen-heights/s, {} satellites",
+                        throw.edge.name(),
+                        throw.along * 100.0,
+                        (throw.vel_x * throw.vel_x + throw.vel_y * throw.vel_y).sqrt(),
+                        throw.sats.len()
+                    );
+                    held.push((Instant::now(), throw));
+                    net.commit_arrival();
+                }
+                NetEvent::Landed { peer, .. } => {
+                    returned += 1;
+                    println!("[echo] thrown back; {peer} has it ({returned} returned)");
+                }
+                NetEvent::Refused { peer, why, .. } => {
+                    eprintln!("[echo] {peer} refused it: {}", why.explain());
+                }
+                NetEvent::Lost { peer, why, .. } => {
+                    eprintln!("[echo] the throw back to {peer} was lost: {why}");
+                }
+                NetEvent::PeerUp { name, screen, .. } => {
+                    println!("[echo] {name} is here ({}x{})", screen.0, screen.1);
+                }
+                NetEvent::PeerDown { name } => println!("[echo] {name} has gone"),
+                NetEvent::Note(m) => eprintln!("[echo] {m}"),
+            }
+        }
+
+        // Anything held long enough goes straight back the way it came: out of the
+        // edge it arrived through, with its velocity reversed. On the far screen
+        // that reads as the blob coming back in the edge it left by.
+        let now = Instant::now();
+        let mut still_held = Vec::with_capacity(held.len());
+        for (at, throw) in held.drain(..) {
+            if now.duration_since(at) < opts.hold {
+                still_held.push((at, throw));
+                continue;
+            }
+            let back = throw.edge.opposite();
+            if net
+                .throw(back, throw.along, (-throw.vel_x, -throw.vel_y), throw.sats.clone())
+                .is_none()
+            {
+                // Nobody to throw it to yet. Hold on to it and try again; the peer
+                // may simply not have been heard from since it restarted.
+                eprintln!("[echo] nowhere to throw it back to; still holding");
+                still_held.push((now, throw));
+            }
+        }
+        held = still_held;
+
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn write_pam(path: &str, w: u32, h: u32, rgba: &[u8]) -> Result<(), String> {
     use std::io::Write;
     let mut f = std::fs::File::create(path)
@@ -784,6 +1473,7 @@ enum CtxKind {
 /// be retried as one unit.
 fn build_window_and_context(
     video: &sdl2::VideoSubsystem,
+    origin: (i32, i32),
     w: u32,
     h: u32,
     overlay_mode: bool,
@@ -820,7 +1510,11 @@ fn build_window_and_context(
     if overlay_mode {
         // Created hidden so the EWMH properties and an empty input region are in
         // place before the window manager ever sees it mapped.
-        builder.position(0, 0).borderless().hidden();
+        builder.position(origin.0, origin.1).borderless().hidden();
+        // Retina: ask for the full backing resolution. The frame loop already
+        // scales the metaballs by the drawable-to-logical ratio, so this is the
+        // difference between a crisp blob and a blurry one on a Mac laptop.
+        builder.allow_highdpi();
     } else {
         builder.position_centered().resizable();
     }
@@ -833,46 +1527,12 @@ fn build_window_and_context(
     Ok((window, ctx))
 }
 
-/// Pull the X11 window id out of SDL.
-///
-/// Route (a) from the two available: `SDL_GetWindowWMInfo` with a version-stamped
-/// `SDL_SysWMinfo`. Chosen over the `raw-window-handle` route because that one
-/// panics internally when the query fails, and window setup is exactly where a
-/// panic is least useful.
-fn x_window_id(window: &sdl2::video::Window) -> Result<u64, String> {
-    // SAFETY: `info` is a plain C struct with no invalid bit patterns for the fields
-    // SDL reads, the version is stamped before the call as SDL requires, and
-    // `window.raw()` is a live SDL_Window for the lifetime of the borrow.
-    unsafe {
-        let mut info: sdl2::sys::SDL_SysWMinfo = std::mem::zeroed();
-        sdl2::sys::SDL_GetVersion(&mut info.version);
-        if sdl2::sys::SDL_GetWindowWMInfo(window.raw(), &mut info) != sdl2::sys::SDL_bool::SDL_TRUE
-        {
-            return Err(format!(
-                "SDL_GetWindowWMInfo failed: {}\n\
-                 Without the X window id the overlay cannot set its EWMH properties \
-                 or its click-through input region.",
-                sdl2::get_error()
-            ));
-        }
-        if info.subsystem != sdl2::sys::SDL_SYSWM_TYPE::SDL_SYSWM_X11 {
-            return Err(format!(
-                "the SDL window is not an X11 window (SDL_SYSWM_TYPE = {}).\n\
-                 liquidMetal must run as an X11 client; set DISPLAY and make sure \
-                 XWayland is available.",
-                info.subsystem as u32
-            ));
-        }
-        Ok(info.info.x11.window as u64)
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn print_diagnostics(
     video: &sdl2::VideoSubsystem,
     window: &sdl2::video::Window,
     renderer: &render::Renderer,
-    x11: &Option<overlay::X11>,
+    x11: &Option<overlay::Overlay>,
     xid: u64,
     alpha_bits: u8,
     rgb_bits: (u8, u8, u8),
@@ -918,59 +1578,15 @@ fn print_diagnostics(
     println!("  vsync             : {}", if vsync { "on" } else { "unavailable" });
     println!("  window size       : {w} x {h} logical, {dw} x {dh} drawable");
     match x11 {
+        // Everything platform-specific about the window is the overlay's to
+        // describe. The X11 and macOS versions have almost nothing in common to say,
+        // and this is the seam where that stops mattering.
         Some(x) => {
-            println!("  window XID        : {xid:#010x} ({xid})");
-            match x.window_rect() {
-                Ok((wx, wy, ww, wh)) => println!(
-                    "  window on screen  : {ww} x {wh} at ({wx}, {wy}){}",
-                    if (wx, wy) == (0, 0) && (ww, wh) == (x.virtual_w as u32, x.virtual_h as u32) {
-                        "  [matches the virtual screen]"
-                    } else {
-                        "  <-- NOT the full virtual screen"
-                    }
-                ),
-                Err(e) => println!("  window on screen  : unknown ({e})"),
+            for (label, value) in x.describe(xid) {
+                println!("  {label:<18}: {value}");
             }
-            // The authoritative transparency check: GL alpha bits are not enough,
-            // the X window itself has to be depth 32.
-            match x.window_depth() {
-                Ok(32) => println!(
-                    "  X window depth    : 32  <-- ARGB visual {}, alpha channel present",
-                    x.argb_visual
-                        .map(|v| format!("{v:#x}"))
-                        .unwrap_or_else(|| "(SDL's choice)".into())
-                ),
-                Ok(d) => println!(
-                    "  X window depth    : {d}  <-- NO ALPHA CHANNEL: the overlay will be opaque"
-                ),
-                Err(e) => println!("  X window depth    : unknown ({e})"),
-            }
-            println!(
-                "  XShape version    : {}.{}",
-                x.shape_version.0, x.shape_version.1
-            );
-            println!(
-                "  X virtual screen  : {} x {} at (0, 0)",
-                x.virtual_w, x.virtual_h
-            );
-            if x.monitors.is_empty() {
-                println!("  monitors          : (RandR 1.5 GetMonitors unavailable)");
-            } else {
-                for m in &x.monitors {
-                    println!(
-                        "  monitor           : {:<12} {:>5} x {:<5} at ({:>5}, {:>5}){}",
-                        m.name,
-                        m.width,
-                        m.height,
-                        m.x,
-                        m.y,
-                        if m.primary { "  [primary]" } else { "" }
-                    );
-                }
-            }
-            println!("  input region      : empty (whole window click-through)");
         }
-        None => println!("  X11               : not used (--windowed)"),
+        None => println!("  desktop overlay   : not used (--windowed)"),
     }
     // Measured off the actual field rather than assumed, so the log tells you what
     // is really on screen if you have been retuning the radius constants.

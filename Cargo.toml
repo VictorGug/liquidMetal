@@ -3,7 +3,32 @@ name = "liquid-metal"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["bundled-sdl"]
+# Build SDL2 from the crate's vendored C sources rather than linking a system one.
+#
+# On by default because it is the only thing that works on the machine this was
+# written on (SDL2 headers are not installed and there is no sudo), and because it
+# means a Mac needs nothing from Homebrew either — just the Xcode command line
+# tools.
+#
+# Turning it off links a system SDL2 instead. It is also what makes the macOS half
+# of this program checkable from Linux: `cargo check --target aarch64-apple-darwin
+# --no-default-features` type-checks every `cfg(target_os = "macos")` path without
+# needing a macOS SDK to compile C with. See `doc/macos.md`.
+bundled-sdl = ["sdl2/bundled", "sdl2/static-link"]
+
 [dependencies]
 glow = "0.18.0"
-sdl2 = { version = "0.38.0", features = ["bundled", "raw-window-handle", "static-link"] }
+sdl2 = { version = "0.38.0", default-features = false, features = ["raw-window-handle"] }
+socket2 = { version = "0.6.5", features = ["all"] }
+gethostname = "1.0.2"
+
+# The X11 overlay. Linux only: `overlay_x11.rs` is the only thing that uses it.
+[target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.14.0", features = ["shape", "randr"] }
+
+# The Cocoa overlay. A window on macOS is transparent, floating and click-through
+# by way of a handful of Objective-C messages, and this is what sends them.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"

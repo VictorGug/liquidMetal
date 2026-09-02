@@ -8,8 +8,14 @@ use glow::HasContext;
 
 use crate::physics::Ball;
 
-/// Must match `uniform vec4 uBlobs[16]` in the fragment shader.
-pub const MAX_BLOBS: usize = 16;
+/// Must match `uniform vec4 uBlobs[40]` in the fragment shader.
+///
+/// One blob is a core plus `SAT_COUNT` satellites, so this is the ball budget for a
+/// single draw. Blobs that touch are drawn together — that is what makes two of them
+/// merge into one pool of mercury instead of overlapping like decals — so this has
+/// to hold the largest clump that can form, not just one blob. The shader loops to
+/// `uCount`, never to this, so unused slots cost nothing.
+pub const MAX_BLOBS: usize = 40;
 
 const VERT_SRC: &str = r#"#version 330 core
 // Fullscreen triangle from the vertex index alone: (0,0), (2,0), (0,2) in UV,
@@ -112,12 +118,29 @@ impl Renderer {
         }
     }
 
-    /// Draw one frame.
+    /// Start a frame: set the viewport and clear the whole surface to transparent.
     ///
-    /// `scissor` is an optional `(x, y, w, h)` rectangle in top-down pixels; the
-    /// clear always covers the whole surface, and only the shading is restricted.
-    /// Ignored when `opaque`, which needs the background drawn everywhere.
-    pub fn draw(
+    /// Separate from `draw_group` because a frame may contain several groups — one
+    /// per clump of blobs — and the clear must happen exactly once, before any of
+    /// them.
+    pub fn begin_frame(&mut self, width: i32, height: i32) {
+        // SAFETY: context is current for the lifetime of `self`.
+        unsafe {
+            let gl = &self.gl;
+            gl.viewport(0, 0, width, height);
+            gl.disable(glow::SCISSOR_TEST);
+            gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+        }
+    }
+
+    /// Shade one group of balls, restricted to `scissor`.
+    ///
+    /// Every ball in one call contributes to one metaball field, so anything passed
+    /// together merges. `scissor` is an optional `(x, y, w, h)` rectangle in
+    /// top-down pixels, and is ignored when `opaque`, which needs the background
+    /// drawn everywhere.
+    pub fn draw_group(
         &mut self,
         width: i32,
         height: i32,
@@ -138,11 +161,7 @@ impl Renderer {
         // a plain state-setting or draw call with in-range arguments.
         unsafe {
             let gl = &self.gl;
-            gl.viewport(0, 0, width, height);
-
             gl.disable(glow::SCISSOR_TEST);
-            gl.clear_color(0.0, 0.0, 0.0, 0.0);
-            gl.clear(glow::COLOR_BUFFER_BIT);
 
             if !opaque {
                 if let Some((sx, sy, sw, sh)) = scissor {
