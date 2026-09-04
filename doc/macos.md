@@ -139,6 +139,52 @@ The startup log states what was actually done:
 If that line says `NOT SET`, the black rectangle is why. If it says the above and the
 screen is *still* black, the surface never got rebuilt — lengthen `REASSERT_MS`.
 
+### The overlay covers one display, not the desktop
+
+On X11 the overlay is sized to the whole virtual screen and the blob can be dragged
+between monitors. macOS does not allow that by default, and the way it refuses is
+quiet.
+
+With **"Displays have separate Spaces"** on — which is how every Mac ships — each
+display gets its own Space, and a window is composited on exactly one of them however
+large its frame is. `[window frame]` in the startup log will happily report a
+rectangle spanning all three monitors while the blob is only ever drawn on one. The
+world is then several screens wide and the visible part is not: the blob coasts off
+the side of the screen, keeps going, and bounces off a wall nobody can see.
+
+So the overlay covers the **primary display** and nothing else. The blob's world is
+that display, its walls are that display's edges, and none of it depends on a setting
+the person who installed this has to know about.
+
+`--span-displays` opts back into the desktop-wide window. It is worth having because
+it genuinely works — once "Displays have separate Spaces" is turned off in System
+Settings → Desktop & Dock → Mission Control, **and the user has logged out and back
+in**, which is when that setting takes effect. Confirm it took with:
+
+```sh
+defaults read com.apple.spaces spans-displays    # 1 = displays share one Space
+```
+
+The key not existing means the default, which is separate Spaces, which means
+`--span-displays` will give you the invisible walls described above.
+
+Nothing about this is guessed at at run time: `probe_desktop` decides the world,
+`window_rect` reads back what Cocoa actually gave the window, and the blob's bounds
+follow that rather than the request. A window that does not get what it asked for
+confines the blob rather than losing it.
+
+### Displays are a bounding box, not a shape
+
+Even spanning correctly, a desktop is not a rectangle. Three displays of 2560x1440,
+2560x1440 and 1512x982 — the last one vertically centred, as a laptop between two
+monitors usually is — make a desktop 6632x1440 with two holes in it: 1512x119 above
+the short display and 1512x339 below it, belonging to no screen at all.
+
+`dead_regions` in `main.rs` finds those by cutting the desktop along every display
+edge and keeping the cells no display covers, and `Blob::set_dead_regions` makes the
+blob bounce off them. Without it the blob can be flung into a hole and simply
+disappear.
+
 ### A note on debug builds
 
 `objc2` verifies the type encoding of every message send when debug assertions are
