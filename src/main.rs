@@ -136,6 +136,7 @@ impl Default for NetOpts {
 fn main() -> ExitCode {
     let mut mode = Mode::Overlay;
     let mut net = NetOpts::default();
+    let mut span_displays = false;
     let mut args = std::env::args().skip(1);
 
     /// `--flag VALUE`, with a clear error instead of a confusing one when the
@@ -155,6 +156,7 @@ fn main() -> ExitCode {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--windowed" => mode = Mode::Windowed,
+            "--span-displays" => span_displays = true,
             "--selftest" => mode = Mode::SelfTest,
             "--capture" => match args.next() {
                 Some(path) => mode = Mode::Capture(path),
@@ -238,7 +240,7 @@ fn main() -> ExitCode {
         };
     }
 
-    match run(&mode, &net) {
+    match run(&mode, &net, span_displays) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("\nliquidMetal could not start.\n{e}");
@@ -298,7 +300,7 @@ CONTROLS:
     );
 }
 
-fn run(mode: &Mode, netopts: &NetOpts) -> Result<(), String> {
+fn run(mode: &Mode, netopts: &NetOpts, span_displays: bool) -> Result<(), String> {
     let overlay_mode = *mode == Mode::Overlay;
     let capture_path = match mode {
         Mode::Capture(p) => Some(p.clone()),
@@ -338,7 +340,7 @@ fn run(mode: &Mode, netopts: &NetOpts) -> Result<(), String> {
     // macOS cannot answer this until SDL's video subsystem is up, so the desktop is
     // probed here rather than at connect time.
     if let Some(x) = x11.as_mut() {
-        x.probe_desktop(&video)?;
+        x.probe_desktop(&video, span_displays)?;
     }
     let (win_w, win_h) = match &x11 {
         Some(x) => x.desktop_size(),
@@ -547,6 +549,7 @@ fn run(mode: &Mode, netopts: &NetOpts) -> Result<(), String> {
         origin,
         screen,
         geometry_dirty: false,
+        monitors: x11.as_ref().map(|x| x.monitor_rects()).unwrap_or_default(),
         touched: false,
         // On X11 the input region already decided the pointer is on the blob before
         // the event was delivered, so a second test could only disagree with it.
@@ -557,6 +560,28 @@ fn run(mode: &Mode, netopts: &NetOpts) -> Result<(), String> {
         capacity: netopts.capacity,
         portals: 0,
     };
+    // The blob was built from `bounds` alone. Go round once more so it also knows
+    // about the holes between displays before the first frame, rather than only
+    // after the geometry happens to change.
+    app.rebound();
+    {
+        // Only the holes, and only when there are any: the display list, the desktop
+        // and the window's real frame are already in the startup block above, but a
+        // blob bouncing off nothing visible is impossible to explain without this.
+        let rel: Vec<(i32, i32, u32, u32)> = app
+            .monitors
+            .iter()
+            .map(|&(x, y, w, h)| (x - app.origin.0, y - app.origin.1, w, h))
+            .collect();
+        let holes = dead_regions(app.bounds(), &rel);
+        if !holes.is_empty() {
+            eprintln!(
+                "[geometry] {} part(s) of the desktop are not on any display; \
+                 the blob bounces off them: {holes:?}",
+                holes.len()
+            );
+        }
+    }
 
     // --- the network, if it was asked for ---
     //
@@ -920,6 +945,9 @@ struct App {
     /// with the X server's under XWayland, so this only marks the geometry stale;
     /// the real numbers are re-read from X.
     geometry_dirty: bool,
+    /// Every display, relative to the desktop rectangle. Used to find the holes the
+    /// desktop's bounding box leaves between screens of different sizes.
+    monitors: Vec<(i32, i32, u32, u32)>,
     /// In overlay mode the XShape input region already decided that the pointer is
     /// on the blob before X delivered this event, so there is nothing to re-test —
     /// and a second test here could only ever *disagree* with the region. Windowed
@@ -983,8 +1011,17 @@ impl App {
     /// Re-derive every blob's world after the window has moved or been resized.
     fn rebound(&mut self) {
         let b = visible_bounds(self.origin, (self.logical_w, self.logical_h), self.screen);
+        // The displays are given relative to the desktop; the blob works in
+        // window-relative pixels, so shift them by wherever the window ended up.
+        let rel: Vec<(i32, i32, u32, u32)> = self
+            .monitors
+            .iter()
+            .map(|&(x, y, w, h)| (x - self.origin.0, y - self.origin.1, w, h))
+            .collect();
+        let dead = dead_regions(b, &rel);
         for s in self.blobs.iter_mut() {
             s.blob.set_bounds(b);
+            s.blob.set_dead_regions(&dead);
         }
         net::publish_screen_size((b.x1 - b.x0) as u32, (b.y1 - b.y0) as u32);
     }
@@ -1120,6 +1157,75 @@ fn visible_bounds(origin: (i32, i32), win: (u32, u32), screen: (u32, u32)) -> Bo
         return Bounds::screen(win.0 as f32, win.1 as f32);
     }
     Bounds { x0: x0 as f32, y0: y0 as f32, x1: x1 as f32, y1: y1 as f32 }
+}
+
+/// The parts of `area` that no display covers, as rectangles.
+///
+/// A desktop is a bounding box, not a shape. Three displays of 2560x1440, 2560x1440
+/// and 1512x982 side by side make a desktop 6632x1440 — and leave a 1512x458 hole
+/// under the short one that belongs to no screen at all. The blob has to bounce off
+/// that hole, so it is decomposed here into rectangles physics can treat as walls.
+///
+/// The method is a grid: cut `area` along every display edge that falls inside it,
+/// then keep the cells whose centre no display contains. That is exact for
+/// axis-aligned displays however they are arranged, and with at most a handful of
+/// screens the grid is a few cells across. Horizontally adjacent dead cells in the
+/// same row are merged, which is what turns the common case — one hole under one
+/// short display — into the single rectangle it looks like.
+fn dead_regions(area: Bounds, monitors: &[(i32, i32, u32, u32)]) -> Vec<Bounds> {
+    // No display information is not the same as no displays: say there are no holes
+    // rather than declaring the whole desktop one.
+    if monitors.is_empty() {
+        return Vec::new();
+    }
+    let mut xs = vec![area.x0, area.x1];
+    let mut ys = vec![area.y0, area.y1];
+    for &(x, y, w, h) in monitors {
+        for v in [x as f32, (x + w as i32) as f32] {
+            if v > area.x0 && v < area.x1 {
+                xs.push(v);
+            }
+        }
+        for v in [y as f32, (y + h as i32) as f32] {
+            if v > area.y0 && v < area.y1 {
+                ys.push(v);
+            }
+        }
+    }
+    let sort_dedup = |v: &mut Vec<f32>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        v.dedup_by(|a, b| (*a - *b).abs() < 0.5);
+    };
+    sort_dedup(&mut xs);
+    sort_dedup(&mut ys);
+
+    let covered = |cx: f32, cy: f32| {
+        monitors.iter().any(|&(x, y, w, h)| {
+            cx >= x as f32
+                && cx < (x + w as i32) as f32
+                && cy >= y as f32
+                && cy < (y + h as i32) as f32
+        })
+    };
+
+    let mut out: Vec<Bounds> = Vec::new();
+    for yi in 0..ys.len().saturating_sub(1) {
+        let (y0, y1) = (ys[yi], ys[yi + 1]);
+        for xi in 0..xs.len().saturating_sub(1) {
+            let (x0, x1) = (xs[xi], xs[xi + 1]);
+            if covered((x0 + x1) * 0.5, (y0 + y1) * 0.5) {
+                continue;
+            }
+            // Merge with the cell to the left when they share an edge and a row.
+            match out.last_mut() {
+                Some(prev) if prev.y0 == y0 && prev.y1 == y1 && (prev.x1 - x0).abs() < 0.5 => {
+                    prev.x1 = x1;
+                }
+                _ => out.push(Bounds { x0, y0, x1, y1 }),
+            }
+        }
+    }
+    out
 }
 
 /// Write RGBA8 pixels as a NetPBM PAM file.

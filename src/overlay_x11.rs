@@ -221,7 +221,14 @@ impl X11 {
     /// Nothing to do here: the X server told us the virtual screen at `connect`
     /// time, before SDL existed. macOS cannot answer until SDL's video subsystem is
     /// up, which is why this step exists at all.
-    pub fn probe_desktop(&mut self, _video: &sdl2::VideoSubsystem) -> Result<(), String> {
+    /// `_span` is ignored: an X11 window spans the virtual screen without asking
+    /// anyone's permission, so the union is always the right answer here. The
+    /// parameter exists because the macOS twin cannot make that assumption.
+    pub fn probe_desktop(
+        &mut self,
+        _video: &sdl2::VideoSubsystem,
+        _span: bool,
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -618,6 +625,18 @@ impl X11 {
     /// Nothing to re-assert per frame. The macOS twin rebuilds its GL surface here,
     /// because on that platform transparency does not stick until the window has been
     /// presented; X11 settles it once, when the visual is chosen.
+    /// Every monitor's rectangle, relative to the desktop rectangle's top-left —
+    /// which on X11 is the virtual screen, and always starts at (0, 0).
+    ///
+    /// Empty when RandR 1.5 is unavailable, which the caller reads as "no holes to
+    /// worry about" rather than "no screens".
+    pub fn monitor_rects(&self) -> Vec<(i32, i32, u32, u32)> {
+        self.monitors
+            .iter()
+            .map(|m| (m.x as i32, m.y as i32, m.width as u32, m.height as u32))
+            .collect()
+    }
+
     pub fn on_frame(&mut self) {}
 
     /// Put the window back at the origin at full virtual-screen size.

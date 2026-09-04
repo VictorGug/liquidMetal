@@ -62,6 +62,49 @@ unsafe impl RefEncode for CGColor {
     const ENCODING_REF: Encoding = Encoding::Pointer(&Self::ENCODING);
 }
 
+/// Cocoa geometry, for asking the window where it actually is.
+///
+/// Needed because the answer cannot be assumed: macOS is free to place and size a
+/// window differently from what was asked for, and on a multi-display desktop it
+/// routinely does.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGPoint {
+    x: f64,
+    y: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGSize {
+    width: f64,
+    height: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGRect {
+    origin: CGPoint,
+    size: CGSize,
+}
+
+// SAFETY: these are the layouts and encodings the Objective-C runtime reports for
+// the Core Graphics geometry structs on 64-bit, where CGFloat is a double.
+unsafe impl Encode for CGPoint {
+    const ENCODING: Encoding =
+        Encoding::Struct("CGPoint", &[<f64 as Encode>::ENCODING, <f64 as Encode>::ENCODING]);
+}
+unsafe impl Encode for CGSize {
+    const ENCODING: Encoding =
+        Encoding::Struct("CGSize", &[<f64 as Encode>::ENCODING, <f64 as Encode>::ENCODING]);
+}
+unsafe impl Encode for CGRect {
+    const ENCODING: Encoding = Encoding::Struct(
+        "CGRect",
+        &[<CGPoint as Encode>::ENCODING, <CGSize as Encode>::ENCODING],
+    );
+}
+
 // ---------------------------------------------------------------------------
 // TUNABLES
 // ---------------------------------------------------------------------------
@@ -87,6 +130,14 @@ const WINDOW_ALPHA: f64 = 0.99;
 /// handful of Objective-C messages and covers whatever the real threshold is on a
 /// given machine. The last one is late enough to survive a slow first frame.
 const REASSERT_MS: &[u64] = &[200, 500, 1000, 2000, 4000];
+
+/// Frames after the window is shown on which to ask for the full desktop again.
+///
+/// A window is not guaranteed to span several displays on macOS, and the request
+/// made at creation is the one most likely to be refused. These are all well inside
+/// the 90 frames `main.rs` polls the geometry for, so the blob's world ends up
+/// matching whatever the last answer was.
+const GEOMETRY_REASK_FRAMES: &[u32] = &[1, 3, 10, 30];
 
 /// `NSWindowCollectionBehaviorCanJoinAllSpaces | Stationary | FullScreenAuxiliary`.
 /// Follow the user between Spaces instead of belonging to the one it was born on,
@@ -210,7 +261,8 @@ pub struct DisplayInfo {
 pub struct Mac {
     /// `NSWindow *`. Null until `set_window`.
     ns_window: *mut AnyObject,
-    /// The union of every display, in SDL's global desktop coordinates.
+    /// The overlay's world, in SDL's global desktop coordinates: one display by
+    /// default, the union of every display under `--span-displays`.
     ///
     /// The origin can be negative when a display sits left of or above the primary
     /// one. Everything `main.rs` sees is relative to this rectangle, which is why
@@ -232,6 +284,12 @@ pub struct Mac {
     /// See `on_frame` for why the overlay cannot simply be made transparent once.
     shown_at: Option<std::time::Instant>,
     pending_reasserts: &'static [u64],
+    /// The window's real top-left in SDL's global desktop coordinates, as last read
+    /// back from Cocoa. Not the same as `origin` whenever macOS declined to give us
+    /// the whole desktop, which on a multi-display machine is the normal case.
+    window_origin: (i32, i32),
+    /// Frames since the window was shown, for the geometry re-ask schedule.
+    geometry_frames: u32,
     /// There is no visual to choose on macOS; Cocoa composites every window. Present
     /// only because `main.rs` reads it on both platforms.
     pub argb_visual: Option<u32>,
@@ -251,6 +309,8 @@ impl Mac {
             surface_made_transparent: false,
             shown_at: None,
             pending_reasserts: REASSERT_MS,
+            window_origin: (0, 0),
+            geometry_frames: 0,
             argb_visual: None,
         })
     }
@@ -261,7 +321,11 @@ impl Mac {
     /// in the same top-left-origin coordinate space it will later place the window
     /// in, so there is no chance of getting Cocoa's bottom-left origin flip wrong in
     /// one place and right in another.
-    pub fn probe_desktop(&mut self, video: &sdl2::VideoSubsystem) -> Result<(), String> {
+    pub fn probe_desktop(
+        &mut self,
+        video: &sdl2::VideoSubsystem,
+        span: bool,
+    ) -> Result<(), String> {
         let n = video
             .num_video_displays()
             .map_err(|e| format!("SDL could not enumerate the displays: {e}"))?;
@@ -288,9 +352,50 @@ impl Mac {
                 primary: i == 0,
             });
         }
-        self.origin = (x0, y0);
-        self.size = ((x1 - x0).max(1) as u32, (y1 - y0).max(1) as u32);
+        // One display unless asked otherwise, and the default is the interesting
+        // half of this function.
+        //
+        // A window spanning several displays is not something macOS grants on its
+        // own: with "Displays have separate Spaces" on — which is how every Mac
+        // ships — each display gets its own Space and a window is composited on one
+        // of them, whatever its frame says. Sizing the overlay to the whole desktop
+        // therefore produces a blob with a world several screens wide that is only
+        // ever drawn on one of them: it coasts out of sight and bounces off walls
+        // nobody can see. Confining the overlay to a single display is the only
+        // behaviour that is correct without the user changing a system setting and
+        // logging out, so it is what an installed copy does.
+        //
+        // `--span-displays` opts into the desktop-wide window for anyone who has
+        // turned that setting off, where it works properly.
+        let (ox, oy, w, h) = if span {
+            (x0, y0, (x1 - x0).max(1) as u32, (y1 - y0).max(1) as u32)
+        } else {
+            let d = self
+                .displays
+                .iter()
+                .find(|d| d.primary)
+                .or_else(|| self.displays.first())
+                .ok_or("SDL reports no displays at all")?;
+            (d.x, d.y, d.width, d.height)
+        };
+        self.origin = (ox, oy);
+        self.size = (w, h);
+        // Until there is a window to ask, assume we got what we are about to request.
+        self.window_origin = self.origin;
         Ok(())
+    }
+
+    /// Every display's rectangle, relative to the desktop rectangle's top-left.
+    ///
+    /// Relative rather than global so both platforms answer in the same space: the X
+    /// virtual screen always starts at (0, 0), while a Mac desktop with a display
+    /// left of the primary one starts at a negative x. The caller should not have to
+    /// know which it is talking to.
+    pub fn monitor_rects(&self) -> Vec<(i32, i32, u32, u32)> {
+        self.displays
+            .iter()
+            .map(|d| (d.x - self.origin.0, d.y - self.origin.1, d.width, d.height))
+            .collect()
     }
 
     pub fn desktop_size(&self) -> (u32, u32) {
@@ -445,6 +550,23 @@ impl Mac {
             let _ = self.apply_overlay_properties();
             let _ = self.on_gl_context_ready();
         }
+
+        // Ask for the whole desktop again on the first few frames. macOS will have
+        // placed the window on one display if it would not span them, and asking
+        // once more after it has settled sometimes sticks where the request at
+        // creation did not — the same argument, and the same remedy, as the window
+        // manager on X11. Kept well inside the 90 frames `main.rs` spends polling
+        // the geometry, so whatever we end up with is what the blob's walls follow.
+        self.geometry_frames = self.geometry_frames.saturating_add(1);
+        if GEOMETRY_REASK_FRAMES.contains(&self.geometry_frames) {
+            let _ = self.force_full_screen_geometry();
+        }
+
+        // The cursor test below runs every frame against window-relative rectangles,
+        // so the window's real origin has to be current, not the one we hoped for.
+        if let Some((gx, gy, _, _)) = self.read_window_frame() {
+            self.window_origin = (gx, gy);
+        }
     }
 
     fn set_ignores_mouse(&mut self, ignore: bool) -> Result<(), String> {
@@ -483,9 +605,12 @@ impl Mac {
         self.rects.extend_from_slice(rects);
         let on_blob = match global_cursor() {
             Some((gx, gy)) => {
-                // The rectangles are window-relative; the cursor is not.
-                let x = gx - self.origin.0;
-                let y = gy - self.origin.1;
+                // The rectangles are window-relative; the cursor is not. Relative to
+                // the *window*, which is not the desktop origin whenever macOS put us
+                // on one display instead of across all of them — get this wrong and
+                // the blob is grabbable somewhere it is not drawn.
+                let x = gx - self.window_origin.0;
+                let y = gy - self.window_origin.1;
                 rects
                     .iter()
                     .any(|(rx, ry, rw, rh)| x >= *rx && y >= *ry && x < rx + rw && y < ry + rh)
@@ -544,6 +669,11 @@ impl Mac {
     /// until it appeared" bug that would be very hard to diagnose remotely.
     pub fn nudge_state(&mut self) -> Result<(), String> {
         self.shown_at = Some(std::time::Instant::now());
+        // Before the first frame, so the very first cursor test uses the window's
+        // real origin rather than the desktop's.
+        if let Some((gx, gy, _, _)) = self.read_window_frame() {
+            self.window_origin = (gx, gy);
+        }
         self.apply_overlay_properties()?;
         // And the surface parameter too, in case showing the window rebuilt the
         // surface underneath it. Cheap, and the failure it guards against — an
@@ -552,15 +682,90 @@ impl Mac {
         self.on_gl_context_ready()
     }
 
-    /// The window covers the desktop exactly, so in its own coordinates it is always
-    /// at the origin. See the note on `Mac::origin` for why this is not a lie.
-    pub fn window_rect(&self) -> Result<(i32, i32, u32, u32), String> {
-        Ok((0, 0, self.size.0, self.size.1))
+    /// The height of the primary display, which is the one axis Cocoa and SDL
+    /// disagree about.
+    ///
+    /// SDL measures from the top-left of the primary display downwards; Cocoa from
+    /// its bottom-left upwards. Converting between them is a subtraction from this
+    /// number and nothing else — but it has to be the *primary* display's height,
+    /// not the desktop's, because that is where both coordinate spaces are pinned.
+    fn primary_height(&self) -> f64 {
+        self.displays
+            .iter()
+            .find(|d| d.primary)
+            .map(|d| d.height as f64)
+            .unwrap_or(self.size.1 as f64)
     }
 
-    /// Nothing to re-assert: no window manager moved us. Kept because the frame loop
-    /// calls it on both platforms.
+    /// What Cocoa says the window's frame is, in SDL's global desktop coordinates.
+    ///
+    /// The whole point of this function is that the answer is not what we asked for.
+    /// A window is not guaranteed to span several displays on macOS, and when it does
+    /// not, everything downstream — the walls the blob bounces off, the cursor test
+    /// that decides whether a click is ours — has to be told the real rectangle
+    /// rather than the requested one.
+    fn read_window_frame(&self) -> Option<(i32, i32, u32, u32)> {
+        if self.ns_window.is_null() {
+            return None;
+        }
+        // SAFETY: live NSWindow; `frame` is a documented NSWindow method returning
+        // an NSRect, whose layout and encoding `CGRect` matches on 64-bit.
+        let f: CGRect = unsafe { msg_send![self.ns_window, frame] };
+        if !(f.size.width.is_finite() && f.size.height.is_finite()) || f.size.width < 1.0 {
+            return None;
+        }
+        let x = f.origin.x.round() as i32;
+        // Cocoa's y is the bottom edge measured up; SDL's is the top edge measured
+        // down.
+        let y = (self.primary_height() - (f.origin.y + f.size.height)).round() as i32;
+        Some((x, y, f.size.width.round() as u32, f.size.height.round() as u32))
+    }
+
+    /// Where the window really is, relative to the desktop rectangle.
+    ///
+    /// The X11 twin reads this from the X server precisely because the window manager
+    /// is free to ignore the request, and the frame loop is built to cope with an
+    /// answer that is not what was asked for. macOS needs exactly the same treatment
+    /// and for a nearer reason: a window does not reliably span several displays
+    /// here, so on a three-monitor desktop the overlay can end up on one of them
+    /// while still believing it covers all three. The blob then bounces off walls
+    /// that are off the side of the visible screen, having sailed out of sight to
+    /// reach them.
+    ///
+    /// Reported relative to `origin` so that the window sits inside a desktop that
+    /// starts at (0, 0), which is the space `visible_bounds` in `main.rs` works in.
+    /// A display to the left of the primary one gives the desktop a negative origin,
+    /// and that offset has to come out here rather than being carried further.
+    pub fn window_rect(&self) -> Result<(i32, i32, u32, u32), String> {
+        match self.read_window_frame() {
+            Some((gx, gy, w, h)) => Ok((gx - self.origin.0, gy - self.origin.1, w, h)),
+            // No window yet: the requested geometry is the best answer available.
+            None => Ok((0, 0, self.size.0, self.size.1)),
+        }
+    }
+
+    /// Ask for the whole desktop again, the way the X11 twin asks a window manager.
+    ///
+    /// `setContentSize:` and `setFrameOrigin:` rather than `setFrame:display:`,
+    /// deliberately: `setFrame:display:` runs the frame through
+    /// `constrainFrameRect:toScreen:` first, which is the thing that pulls a window
+    /// back onto a single display. The other two do not, so this is the request that
+    /// has a chance of being granted. Whether it was is not assumed — `window_rect`
+    /// reads it back, and the blob's world follows whatever we actually got.
     pub fn force_full_screen_geometry(&self) -> Result<(), String> {
+        let w = self.win()?;
+        let width = self.size.0 as f64;
+        let height = self.size.1 as f64;
+        let x = self.origin.0 as f64;
+        let y = self.primary_height() - (self.origin.1 as f64 + height);
+        autoreleasepool(|_| {
+            // SAFETY: live NSWindow; both are documented NSWindow methods taking the
+            // Core Graphics structs declared above.
+            unsafe {
+                let _: () = msg_send![w, setContentSize: CGSize { width, height }];
+                let _: () = msg_send![w, setFrameOrigin: CGPoint { x, y }];
+            }
+        });
         Ok(())
     }
 
@@ -596,6 +801,23 @@ impl Mac {
             },
         ));
         out.push(("window level", format!("{WINDOW_LEVEL} (NSStatusWindowLevel)")));
+        // Whether we actually got the desktop we asked for. On one display this is
+        // always yes; across several it frequently is not, and the blob's walls
+        // follow this rectangle rather than the one above.
+        out.push((
+            "window frame",
+            match self.read_window_frame() {
+                Some((x, y, w, h)) if (w, h) == self.size && (x, y) == self.origin => {
+                    format!("{w}x{h} at ({x}, {y}) — the whole desktop, as asked")
+                }
+                Some((x, y, w, h)) => format!(
+                    "{w}x{h} at ({x}, {y})  <-- NOT the whole desktop ({}x{} at ({}, {})); \
+                     macOS confined the overlay, so the blob is confined with it",
+                    self.size.0, self.size.1, self.origin.0, self.origin.1
+                ),
+                None => "not readable".to_string(),
+            },
+        ));
         for d in &self.displays {
             out.push((
                 "display",

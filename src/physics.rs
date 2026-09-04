@@ -282,6 +282,12 @@ pub struct Blob {
     /// Rest offsets on the unit circle scaled to `SAT_ORBIT`, in blob-local space.
     rest: [Vec2; SAT_COUNT],
     pub bounds: Bounds,
+    /// Rectangles inside `bounds` that no display covers, which the blob is kept out
+    /// of. A desktop is a bounding box, not a shape: displays of different heights
+    /// leave holes under the short ones belonging to no screen at all, and a blob
+    /// flung into one simply disappears. Empty on a single display, and on any
+    /// desktop whose displays happen to tile the box exactly.
+    dead: Vec<Bounds>,
     /// `Some(offset)` while held: the vector from core to the point that was grabbed,
     /// so the blob does not snap its centre to the cursor.
     grab: Option<Vec2>,
@@ -313,6 +319,7 @@ impl Blob {
             sats: [Particle::default(); SAT_COUNT],
             rest,
             bounds,
+            dead: Vec::new(),
             grab: None,
             grab_target: c,
             still_for: 0.0,
@@ -409,6 +416,15 @@ impl Blob {
 
     pub fn set_bounds(&mut self, b: Bounds) {
         self.bounds = b;
+    }
+
+    /// The holes in the desktop, in the same window-relative pixels as `bounds`.
+    ///
+    /// Recomputed with the bounds whenever the window moves or the displays change,
+    /// because a hole is defined by where the displays are, not by the blob.
+    pub fn set_dead_regions(&mut self, rects: &[Bounds]) {
+        self.dead.clear();
+        self.dead.extend_from_slice(rects);
     }
 
     /// Set which edges are doors rather than walls.
@@ -689,6 +705,43 @@ impl Blob {
             hit = Some((v2(0.0, -1.0), impact));
         }
 
+        // The holes. Each is an obstacle grown by the blob's radius, so the body
+        // stops at the edge of the missing screen rather than half-vanishing into
+        // it. Indexed rather than iterated because the core is mutated inside.
+        for i in 0..self.dead.len() {
+            let d = self.dead[i];
+            let (x0, y0, x1, y1) = (d.x0 - r, d.y0 - r, d.x1 + r, d.y1 + r);
+            let p = self.core.p;
+            if p.x <= x0 || p.x >= x1 || p.y <= y0 || p.y >= y1 {
+                continue;
+            }
+            // Leave by the nearest side: anything else teleports the blob across the
+            // hole when it enters near a corner.
+            let (dl, dr_, dt, db) = (p.x - x0, x1 - p.x, p.y - y0, y1 - p.y);
+            let m = dl.min(dr_).min(dt).min(db);
+            if m == dl {
+                let impact = self.core.v.x.max(0.0);
+                self.core.p.x = x0;
+                self.core.v.x = -self.core.v.x.abs() * RESTITUTION;
+                hit = Some((v2(-1.0, 0.0), impact));
+            } else if m == dr_ {
+                let impact = (-self.core.v.x).max(0.0);
+                self.core.p.x = x1;
+                self.core.v.x = self.core.v.x.abs() * RESTITUTION;
+                hit = Some((v2(1.0, 0.0), impact));
+            } else if m == dt {
+                let impact = self.core.v.y.max(0.0);
+                self.core.p.y = y0;
+                self.core.v.y = -self.core.v.y.abs() * RESTITUTION;
+                hit = Some((v2(0.0, -1.0), impact));
+            } else {
+                let impact = (-self.core.v.y).max(0.0);
+                self.core.p.y = y1;
+                self.core.v.y = self.core.v.y.abs() * RESTITUTION;
+                hit = Some((v2(0.0, 1.0), impact));
+            }
+        }
+
         if let Some((n, impact)) = hit {
             if impact > REST_SPEED {
                 let kick = (impact * IMPACT_KICK).min(IMPACT_RIPPLE_PX * SPRING_K.sqrt());
@@ -883,6 +936,57 @@ impl Blob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The desktop is a bounding box; the blob must not fall into the parts of it
+    /// that are not a screen.
+    ///
+    /// Modelled on a real three-display desk: 2560x1440, 2560x1440 and 1512x982 in a
+    /// row make a 6632x1440 desktop with a 1512x458 hole under the short one.
+    #[test]
+    fn the_blob_is_kept_out_of_the_hole_between_displays() {
+        let world = Bounds::screen(6632.0, 1440.0);
+        let hole = Bounds { x0: 5120.0, y0: 982.0, x1: 6632.0, y1: 1440.0 };
+        let mut b = Blob::new(world);
+        b.set_dead_regions(&[hole]);
+
+        // Aimed down into the hole from above the short display.
+        b.core.p = v2(5800.0, 900.0);
+        b.core.v = v2(0.0, 1200.0);
+        for _ in 0..480 {
+            b.step(SUBSTEP);
+        }
+
+        assert!(
+            b.core.p.y <= hole.y0 - COLLIDE_RADIUS + 1.0,
+            "the blob sank into the hole: y = {}, hole starts at {}",
+            b.core.p.y,
+            hole.y0
+        );
+        // And it is still on the desktop, not flung out of the far side of the hole.
+        assert!(b.core.p.x > world.x0 && b.core.p.x < world.x1);
+    }
+
+    /// The hole is not a wall for a screen that does reach that far down: the blob
+    /// must still be able to use the full height of the tall displays.
+    #[test]
+    fn the_hole_does_not_wall_off_the_taller_displays() {
+        let world = Bounds::screen(6632.0, 1440.0);
+        let hole = Bounds { x0: 5120.0, y0: 982.0, x1: 6632.0, y1: 1440.0 };
+        let mut b = Blob::new(world);
+        b.set_dead_regions(&[hole]);
+
+        b.core.p = v2(2000.0, 900.0);
+        b.core.v = v2(0.0, 1200.0);
+        for _ in 0..480 {
+            b.step(SUBSTEP);
+        }
+
+        assert!(
+            b.core.p.y > 982.0,
+            "the blob stopped at the short display's height on a tall one: y = {}",
+            b.core.p.y
+        );
+    }
 
     fn screen() -> Bounds {
         Bounds::screen(1920.0, 1080.0)

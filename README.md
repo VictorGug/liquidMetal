@@ -135,6 +135,7 @@ differences are written down.
 | `--selftest` | Step the physics headlessly through a scripted grab / fling / bounce, print PASS/FAIL per assertion, exit non-zero on failure. |
 | `--net` | Find other machines on the network and turn the screen edges that lead to one into doors. See [Throwing it to another machine](#throwing-it-to-another-machine). |
 | `--net-echo` / `--net-serve` | A headless peer that catches a blob and throws it back. The stand-in for a second computer. |
+| `--span-displays` | macOS only: one window across every display instead of one. Needs "Displays have separate Spaces" turned off — see [`doc/macos.md`](doc/macos.md). |
 
 ```sh
 cargo test                              # 51 unit tests
